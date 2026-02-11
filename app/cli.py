@@ -4,10 +4,43 @@ from pathlib import Path
 
 import typer
 
+MASCOT = r"""
+      _____
+     /     \
+    | () () |
+    |  ___  |
+    | |$$$| |
+    | |$$$| |
+    |  ---  |
+     \_____/
+    /|     |\
+   / |     | \
+     |     |
+     |     |
+    _|  |  |_
+   |____|____|
+
+  TaxBot 9000
+  "I found $0 basis...again."
+"""
+
+
+def show_mascot() -> None:
+    typer.echo(MASCOT)
+
+
 app = typer.Typer(
     name="equitytax",
     help="EquityTax Reconciler — Tax reconciliation for equity compensation.",
 )
+
+
+@app.callback(invoke_without_command=True)
+def main(ctx: typer.Context) -> None:
+    """EquityTax Reconciler — Tax reconciliation for equity compensation."""
+    if ctx.invoked_subcommand is None:
+        show_mascot()
+        raise typer.Exit()
 
 
 @app.command()
@@ -59,4 +92,5 @@ def report(
 
 
 if __name__ == "__main__":
+    show_mascot()
     app()
