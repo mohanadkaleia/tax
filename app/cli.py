@@ -1,4 +1,4 @@
-"""Typer CLI interface for EquityTax Reconciler."""
+"""Typer CLI interface for TaxBot 9000."""
 
 from pathlib import Path
 
@@ -30,14 +30,14 @@ def show_mascot() -> None:
 
 
 app = typer.Typer(
-    name="equitytax",
-    help="EquityTax Reconciler — Tax reconciliation for equity compensation.",
+    name="taxbot",
+    help="TaxBot 9000 — Tax reconciliation for equity compensation.",
 )
 
 
 @app.callback(invoke_without_command=True)
 def main(ctx: typer.Context) -> None:
-    """EquityTax Reconciler — Tax reconciliation for equity compensation."""
+    """TaxBot 9000 — Tax reconciliation for equity compensation."""
     if ctx.invoked_subcommand is None:
         show_mascot()
         raise typer.Exit()

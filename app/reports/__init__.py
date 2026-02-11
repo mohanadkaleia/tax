@@ -1,4 +1,4 @@
-"""Report generation for EquityTax Reconciler."""
+"""Report generation for TaxBot 9000."""
 
 from app.reports.amt_worksheet import AMTWorksheetGenerator
 from app.reports.espp_report import ESPPReportGenerator

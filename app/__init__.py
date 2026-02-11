@@ -1,1 +1,1 @@
-"""EquityTax Reconciler — Tax reconciliation for equity compensation."""
+"""TaxBot 9000 — Tax reconciliation for equity compensation."""

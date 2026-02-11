@@ -1,4 +1,4 @@
-"""Enumerations for EquityTax Reconciler."""
+"""Enumerations for TaxBot 9000."""
 
 from enum import StrEnum
 

@@ -1,4 +1,4 @@
-"""Custom exceptions for EquityTax Reconciler."""
+"""Custom exceptions for TaxBot 9000."""
 
 from decimal import Decimal
 

@@ -1,4 +1,4 @@
-"""Data models for EquityTax Reconciler."""
+"""Data models for TaxBot 9000."""
 
 from app.models.enums import (
     AdjustmentCode,

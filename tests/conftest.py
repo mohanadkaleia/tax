@@ -1,4 +1,4 @@
-"""Shared test fixtures for EquityTax Reconciler."""
+"""Shared test fixtures for TaxBot 9000."""
 
 from datetime import date
 from decimal import Decimal

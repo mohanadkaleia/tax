@@ -1,4 +1,4 @@
-"""Database layer for EquityTax Reconciler."""
+"""Database layer for TaxBot 9000."""
 
 from app.db.repository import TaxRepository
 from app.db.schema import create_schema

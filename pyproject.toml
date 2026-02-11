@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "equitytax-reconciler"
+name = "taxbot-9000"
 version = "0.1.0"
 description = "Tax reconciliation system for equity compensation (ESPP, RSUs, NSOs, ISOs)"
 requires-python = ">=3.11"
@@ -21,7 +21,7 @@ dev = [
 ]
 
 [project.scripts]
-equitytax = "app.cli:app"
+taxbot = "app.cli:app"
 
 [tool.setuptools.packages.find]
 include = ["app*"]

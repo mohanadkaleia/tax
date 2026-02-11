@@ -1,4 +1,4 @@
-"""Data access layer for EquityTax Reconciler."""
+"""Data access layer for TaxBot 9000."""
 
 import sqlite3
 

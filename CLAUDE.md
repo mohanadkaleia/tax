@@ -1,8 +1,8 @@
-# EquityTax Reconciler — CLAUDE.md
+# TaxBot 9000 — CLAUDE.md
 
 ## Project Overview
 
-EquityTax Reconciler is a Python-based system that processes complex U.S. tax situations involving equity compensation (ESPP, RSUs, NSOs, ISOs). It is designed for a single California-resident W-2 employee who receives equity compensation from employers and trades through brokerages such as Morgan Stanley Shareworks and Robinhood.
+TaxBot 9000 is a Python-based system that processes complex U.S. tax situations involving equity compensation (ESPP, RSUs, NSOs, ISOs). It is designed for a single California-resident W-2 employee who receives equity compensation from employers and trades through brokerages such as Morgan Stanley Shareworks and Robinhood.
 
 ### Purpose
 

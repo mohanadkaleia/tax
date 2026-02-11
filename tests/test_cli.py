@@ -11,7 +11,7 @@ class TestCLI:
     def test_help(self):
         result = runner.invoke(app, ["--help"])
         assert result.exit_code == 0
-        assert "EquityTax" in result.output
+        assert "TaxBot" in result.output
 
     def test_import_data_help(self):
         result = runner.invoke(app, ["import-data", "--help"])
