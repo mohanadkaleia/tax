@@ -1,6 +1,25 @@
 > THIS PROJECT IS ONLY FOR TESTING - NEVER USE IT FOR REAL DATA AND NEVER TRUST THE RESULTS.
 
-# EquityTax Reconciler
+# TaxBot 9000
+```bash
+      _____
+     /     \
+    | () () |
+    |  ___  |
+    | |$$$| |
+    | |$$$| |
+    |  ---  |
+     \_____/
+    /|     |\
+   / |     | \
+     |     |
+     |     |
+    _|  |  |_
+   |____|____|
+
+  TaxBot 9000
+  "I found $0 basis...again."
+```
 
 A Python-based tax reconciliation system for U.S. equity compensation. It processes W-2s, 1099-Bs, Forms 3921/3922, and brokerage statements from Morgan Stanley Shareworks and Robinhood to produce corrected cost-basis reports, tax estimates, and filing-ready Form 8949 output.
 
