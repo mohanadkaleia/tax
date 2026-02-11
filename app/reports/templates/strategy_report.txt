@@ -1,0 +1,17 @@
+================================================================================
+                    Tax Strategy Recommendations
+================================================================================
+
+{% for rec in recommendations %}
+Strategy:           {{ rec.name }}
+Situation:          {{ rec.situation }}
+Mechanism:          {{ rec.mechanism }}
+Impact:             {{ rec.quantified_impact }}
+Risk Level:         {{ rec.risk_level }}
+{% if rec.deadline %}Deadline:           {{ rec.deadline }}{% endif %}
+{% if rec.california_impact %}CA Impact:          {{ rec.california_impact }}{% endif %}
+Action Steps:
+{% for step in rec.action_steps %}  - {{ step }}
+{% endfor %}
+--------------------------------------------------------------------------------
+{% endfor %}

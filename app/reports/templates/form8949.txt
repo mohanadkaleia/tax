@@ -1,0 +1,15 @@
+================================================================================
+                        FORM 8949 — Sales and Other Dispositions
+================================================================================
+
+{% for line in lines %}
+Description:    {{ line.description }}
+Date Acquired:  {{ line.date_acquired }}
+Date Sold:      {{ line.date_sold }}
+Proceeds:       ${{ "%.2f"|format(line.proceeds) }}
+Cost Basis:     ${{ "%.2f"|format(line.cost_basis) }}
+Adjustment:     {{ line.adjustment_code.value }} ${{ "%.2f"|format(line.adjustment_amount) }}
+Gain/Loss:      ${{ "%.2f"|format(line.gain_loss) }}
+Category:       {{ line.category.value }}
+--------------------------------------------------------------------------------
+{% endfor %}

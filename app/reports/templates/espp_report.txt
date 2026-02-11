@@ -1,0 +1,17 @@
+================================================================================
+                        ESPP Income Report
+================================================================================
+
+{% for line in lines %}
+Security:           {{ line.security }}
+Offering Date:      {{ line.offering_date }}
+Purchase Date:      {{ line.purchase_date }}
+Sale Date:          {{ line.sale_date }}
+Shares:             {{ line.shares }}
+Disposition:        {{ line.disposition_type.value }}
+Ordinary Income:    ${{ "%.2f"|format(line.ordinary_income) }}
+Adjusted Basis:     ${{ "%.2f"|format(line.adjusted_basis) }}
+Capital Gain/Loss:  ${{ "%.2f"|format(line.capital_gain_loss) }}
+Holding Period:     {{ line.holding_period.value }}
+--------------------------------------------------------------------------------
+{% endfor %}

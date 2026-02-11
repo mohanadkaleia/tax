@@ -1,0 +1,17 @@
+================================================================================
+                    ISO AMT Preference Worksheet
+================================================================================
+
+{% for line in lines %}
+Security:           {{ line.security }}
+Grant Date:         {{ line.grant_date }}
+Exercise Date:      {{ line.exercise_date }}
+Shares:             {{ line.shares }}
+Strike Price:       ${{ "%.2f"|format(line.strike_price) }}
+FMV at Exercise:    ${{ "%.2f"|format(line.fmv_at_exercise) }}
+Spread/Share:       ${{ "%.2f"|format(line.spread_per_share) }}
+Total AMT Pref:     ${{ "%.2f"|format(line.total_amt_preference) }}
+Regular Basis:      ${{ "%.2f"|format(line.regular_basis) }}
+AMT Basis:          ${{ "%.2f"|format(line.amt_basis) }}
+--------------------------------------------------------------------------------
+{% endfor %}

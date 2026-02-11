@@ -1,0 +1,18 @@
+================================================================================
+                    Reconciliation Report — Broker vs. Corrected
+================================================================================
+
+{% for line in lines %}
+Sale ID:            {{ line.sale_id }}
+Security:           {{ line.security }}
+Sale Date:          {{ line.sale_date }}
+Shares:             {{ line.shares }}
+Broker Proceeds:    ${{ "%.2f"|format(line.broker_proceeds) }}
+Broker Basis:       {{ "$%.2f"|format(line.broker_basis) if line.broker_basis is not none else "N/A" }}
+Correct Basis:      ${{ "%.2f"|format(line.correct_basis) }}
+Adjustment:         {{ line.adjustment_code.value }} ${{ "%.2f"|format(line.adjustment) }}
+Broker Gain/Loss:   {{ "$%.2f"|format(line.gain_loss_broker) if line.gain_loss_broker is not none else "N/A" }}
+Correct Gain/Loss:  ${{ "%.2f"|format(line.gain_loss_correct) }}
+Difference:         ${{ "%.2f"|format(line.difference) }}
+--------------------------------------------------------------------------------
+{% endfor %}
