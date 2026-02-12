@@ -62,3 +62,33 @@ class ReconciliationError(TaxComputationError):
 
     def __init__(self, message: str):
         super().__init__(f"Reconciliation error: {message}")
+
+
+class PDFParseError(TaxComputationError):
+    """Raised when PDF parsing fails."""
+
+    def __init__(self, file_path: str, message: str):
+        self.file_path = file_path
+        super().__init__(f"PDF parse error for {file_path}: {message}")
+
+
+class FormDetectionError(PDFParseError):
+    """Raised when form type cannot be auto-detected."""
+
+    def __init__(self, file_path: str):
+        super().__init__(file_path, "Cannot auto-detect form type. Use --form-type to specify.")
+
+
+class ExtractionError(PDFParseError):
+    """Raised when required fields cannot be extracted from the PDF."""
+
+    def __init__(self, file_path: str, fields: list[str]):
+        self.fields = fields
+        super().__init__(file_path, f"Could not extract required fields: {', '.join(fields)}")
+
+
+class VisionExtractionError(PDFParseError):
+    """Raised when Claude Vision API extraction fails."""
+
+    def __init__(self, file_path: str, message: str):
+        super().__init__(file_path, f"Vision extraction failed: {message}")

@@ -1,4 +1,5 @@
 annotated-doc==0.0.4
+anthropic==0.52.0
 annotated-types==0.7.0
 click==8.3.1
 iniconfig==2.3.0
@@ -9,6 +10,8 @@ mdurl==0.1.2
 numpy==2.4.2
 packaging==26.0
 pandas==2.3.3
+pdfminer.six==20251230
+pdfplumber==0.11.9
 pluggy==1.6.0
 pydantic==2.12.5
 pydantic_core==2.41.5
