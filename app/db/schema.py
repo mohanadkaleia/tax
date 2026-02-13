@@ -3,7 +3,7 @@
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS import_batches (
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
     file_path TEXT NOT NULL,
+    tax_year INTEGER,
+    form_type TEXT,
     imported_at TEXT NOT NULL DEFAULT (datetime('now')),
     record_count INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending'
@@ -91,6 +93,51 @@ CREATE TABLE IF NOT EXISTS sale_results (
     wash_sale_disallowed TEXT NOT NULL DEFAULT '0',
     notes TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS w2_forms (
+    id TEXT PRIMARY KEY,
+    import_batch_id TEXT NOT NULL,
+    tax_year INTEGER NOT NULL,
+    employer_name TEXT NOT NULL,
+    box1_wages TEXT NOT NULL,
+    box2_federal_withheld TEXT NOT NULL,
+    box3_ss_wages TEXT,
+    box4_ss_withheld TEXT,
+    box5_medicare_wages TEXT,
+    box6_medicare_withheld TEXT,
+    box12_codes TEXT,
+    box14_other TEXT,
+    box16_state_wages TEXT,
+    box17_state_withheld TEXT,
+    state TEXT DEFAULT 'CA',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (import_batch_id) REFERENCES import_batches(id)
+);
+
+CREATE TABLE IF NOT EXISTS form_1099div (
+    id TEXT PRIMARY KEY,
+    import_batch_id TEXT NOT NULL,
+    tax_year INTEGER NOT NULL,
+    payer_name TEXT,
+    ordinary_dividends TEXT NOT NULL,
+    qualified_dividends TEXT NOT NULL,
+    capital_gain_distributions TEXT,
+    federal_tax_withheld TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (import_batch_id) REFERENCES import_batches(id)
+);
+
+CREATE TABLE IF NOT EXISTS form_1099int (
+    id TEXT PRIMARY KEY,
+    import_batch_id TEXT NOT NULL,
+    tax_year INTEGER NOT NULL,
+    payer_name TEXT,
+    interest_income TEXT NOT NULL,
+    early_withdrawal_penalty TEXT,
+    federal_tax_withheld TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (import_batch_id) REFERENCES import_batches(id)
 );
 
 CREATE TABLE IF NOT EXISTS audit_log (

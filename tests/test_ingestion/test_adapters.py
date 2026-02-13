@@ -34,7 +34,7 @@ class TestManualAdapter:
         adapter = ManualAdapter()
         assert adapter is not None
 
-    def test_parse_not_implemented(self, tmp_path):
+    def test_parse_file_not_found(self, tmp_path):
         adapter = ManualAdapter()
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(FileNotFoundError):
             adapter.parse(tmp_path / "dummy.json")

@@ -48,13 +48,160 @@ def main(ctx: typer.Context) -> None:
 
 @app.command()
 def import_data(
-    source: str = typer.Argument(..., help="Data source: shareworks, robinhood, manual"),
-    file: Path = typer.Argument(..., help="Path to the input file"),
-    year: int = typer.Option(..., help="Tax year"),
+    source: str = typer.Argument(..., help="Data source: manual (shareworks, robinhood coming soon)"),
+    file: Path = typer.Argument(..., help="Path to the JSON file produced by `taxbot parse`"),
+    year: int | None = typer.Option(
+        None,
+        "--year",
+        "-y",
+        help="Tax year (overrides value from JSON if provided)",
+    ),
+    db: Path = typer.Option(
+        Path.home() / ".taxbot" / "taxbot.db",
+        "--db",
+        help="Path to the SQLite database file",
+    ),
 ) -> None:
-    """Import tax data from a brokerage or manual source."""
-    typer.echo(f"Importing from {source}: {file} for tax year {year}")
-    typer.echo("Import not yet implemented.")
+    """Import parsed tax data (JSON) into the TaxBot database."""
+    # Validate file exists and is JSON
+    if not file.exists():
+        typer.echo(f"Error: File not found: {file}", err=True)
+        raise typer.Exit(1)
+    if file.suffix.lower() != ".json":
+        typer.echo(f"Error: File must be JSON: {file}", err=True)
+        raise typer.Exit(1)
+
+    # Validate source
+    valid_sources = {"manual", "shareworks", "robinhood"}
+    if source.lower() not in valid_sources:
+        typer.echo(
+            f"Error: Unknown source '{source}'. Valid sources: {', '.join(sorted(valid_sources))}",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    if source.lower() != "manual":
+        typer.echo(f"Error: '{source}' adapter not yet implemented. Use 'manual'.", err=True)
+        raise typer.Exit(1)
+
+    from app.db.repository import TaxRepository
+    from app.db.schema import create_schema
+    from app.ingestion.manual import ManualAdapter
+    from app.models.tax_forms import W2, Form1099DIV, Form1099INT
+
+    # Parse JSON through ManualAdapter
+    adapter = ManualAdapter()
+    try:
+        result = adapter.parse(file)
+    except (ValueError, KeyError, FileNotFoundError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
+
+    # Override tax year if specified
+    if year:
+        result.tax_year = year
+        for form in result.forms:
+            form.tax_year = year
+        for event in result.events:
+            pass  # Events don't have tax_year; date is enough
+
+    # Validate
+    errors = adapter.validate(result)
+    if errors:
+        typer.echo("Validation errors:", err=True)
+        for error in errors:
+            typer.echo(f"  - {error}", err=True)
+        raise typer.Exit(1)
+
+    # Initialize database
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = create_schema(db)
+    repo = TaxRepository(conn)
+
+    # Check for duplicates
+    duplicates_found = False
+    for form in result.forms:
+        if isinstance(form, W2) and repo.check_w2_duplicate(form.employer_name, form.tax_year):
+            typer.echo(
+                f"Warning: W-2 from {form.employer_name} ({form.tax_year}) already imported",
+                err=True,
+            )
+            duplicates_found = True
+    for event in result.events:
+        if repo.check_event_duplicate(
+            event.event_type.value,
+            event.event_date.isoformat(),
+            str(event.shares),
+        ):
+            typer.echo(
+                f"Warning: {event.event_type.value} event on {event.event_date} "
+                f"({event.shares} shares) may be a duplicate",
+                err=True,
+            )
+            duplicates_found = True
+
+    # Create import batch
+    record_count = len(result.forms) + len(result.events) + len(result.sales)
+    batch_id = repo.create_import_batch(
+        source=source,
+        tax_year=result.tax_year,
+        file_path=str(file),
+        form_type=result.form_type.value,
+        record_count=record_count,
+    )
+
+    # Save all data to database
+    for form in result.forms:
+        if isinstance(form, W2):
+            repo.save_w2(form, batch_id)
+        elif isinstance(form, Form1099DIV):
+            repo.save_1099div(form, batch_id)
+        elif isinstance(form, Form1099INT):
+            repo.save_1099int(form, batch_id)
+
+    for event in result.events:
+        repo.save_event(event, batch_id)
+
+    for lot in result.lots:
+        repo.save_lot(lot, batch_id)
+
+    for sale in result.sales:
+        repo.save_sale(sale, batch_id)
+
+    conn.close()
+
+    # Print summary
+    form_type_label = result.form_type.value.upper()
+    form_count = len(result.forms)
+    event_count = len(result.events)
+    lot_count = len(result.lots)
+    sale_count = len(result.sales)
+
+    # Build a descriptive summary
+    summary_parts = []
+    if form_count:
+        # Try to get a name from the first form for a nice message
+        first = result.forms[0]
+        name = (
+            getattr(first, "employer_name", None)
+            or getattr(first, "broker_name", None)
+            or getattr(first, "payer_name", None)
+            or ""
+        )
+        label = f"{form_count} {form_type_label}"
+        if name:
+            label += f" from {name}"
+        summary_parts.append(label)
+    if event_count:
+        summary_parts.append(f"{event_count} event(s)")
+    if lot_count:
+        summary_parts.append(f"{lot_count} lot(s)")
+    if sale_count:
+        summary_parts.append(f"{sale_count} sale(s)")
+
+    typer.echo(f"Imported {', '.join(summary_parts)} (tax year {result.tax_year})")
+    if duplicates_found:
+        typer.echo("Note: Some records may be duplicates of previously imported data.")
 
 
 @app.command()

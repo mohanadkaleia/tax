@@ -180,7 +180,8 @@ class W2Extractor(BasePDFExtractor):
             )
 
         box5 = self._parse_decimal(data.get("box5_medicare_wages", "")) if data.get("box5_medicare_wages") else None
-        box6 = self._parse_decimal(data.get("box6_medicare_withheld", "")) if data.get("box6_medicare_withheld") else None
+        box6_raw = data.get("box6_medicare_withheld")
+        box6 = self._parse_decimal(box6_raw) if box6_raw else None
         if box5 is not None and box6 is not None and box5 > 0:
             expected_medicare = box5 * self.MEDICARE_TAX_RATE
             if box6 > expected_medicare * Decimal("1.8"):
