@@ -92,3 +92,23 @@ class VisionExtractionError(PDFParseError):
 
     def __init__(self, file_path: str, message: str):
         super().__init__(file_path, f"Vision extraction failed: {message}")
+
+
+class SaleMatchError(TaxComputationError):
+    """Raised when a sale cannot be matched to any lot."""
+
+    def __init__(self, sale_id: str, ticker: str):
+        self.sale_id = sale_id
+        self.ticker = ticker
+        super().__init__(f"No matching lot found for sale {sale_id} ({ticker})")
+
+
+class MissingEventDataError(TaxComputationError):
+    """Raised when required event data (Form 3921/3922) is missing for basis correction."""
+
+    def __init__(self, lot_id: str, equity_type: str):
+        self.lot_id = lot_id
+        self.equity_type = equity_type
+        super().__init__(
+            f"Missing source event data for {equity_type} lot {lot_id}"
+        )

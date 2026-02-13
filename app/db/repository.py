@@ -2,9 +2,11 @@
 
 import json
 import sqlite3
+from decimal import Decimal
 from uuid import uuid4
 
 from app.models.equity_event import EquityEvent, Lot, Sale, SaleResult
+from app.models.reports import AuditEntry
 from app.models.tax_forms import W2, Form1099DIV, Form1099INT
 
 
@@ -190,8 +192,9 @@ class TaxRepository:
             """INSERT OR REPLACE INTO equity_events
                (id, batch_id, event_type, equity_type, ticker, security_name, event_date,
                 shares, price_per_share, strike_price, purchase_price,
-                offering_date, grant_date, ordinary_income, broker_source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                offering_date, fmv_on_offering_date, grant_date, ordinary_income,
+                broker_source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 event.id,
                 batch_id,
@@ -205,6 +208,7 @@ class TaxRepository:
                 str(event.strike_price) if event.strike_price else None,
                 str(event.purchase_price) if event.purchase_price else None,
                 event.offering_date.isoformat() if event.offering_date else None,
+                str(event.fmv_on_offering_date) if event.fmv_on_offering_date else None,
                 event.grant_date.isoformat() if event.grant_date else None,
                 str(event.ordinary_income) if event.ordinary_income else None,
                 event.broker_source.value,
@@ -218,15 +222,17 @@ class TaxRepository:
         """Insert a sale record."""
         self.conn.execute(
             """INSERT OR REPLACE INTO sales
-               (id, lot_id, ticker, sale_date, shares, proceeds_per_share,
-                broker_reported_basis, broker_reported_basis_per_share,
+               (id, lot_id, ticker, security_name, sale_date, shares,
+                proceeds_per_share, broker_reported_basis,
+                broker_reported_basis_per_share,
                 wash_sale_disallowed, form_1099b_received, basis_reported_to_irs,
                 broker_source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 sale.id,
-                sale.lot_id,
+                sale.lot_id if sale.lot_id else None,
                 sale.security.ticker,
+                sale.security.name,
                 sale.sale_date.isoformat(),
                 str(sale.shares),
                 str(sale.proceeds_per_share),
@@ -245,7 +251,7 @@ class TaxRepository:
     def save_sale_result(self, result: SaleResult) -> None:
         """Insert a sale result (basis correction output)."""
         self.conn.execute(
-            """INSERT OR REPLACE INTO sale_results
+            """INSERT INTO sale_results
                (sale_id, lot_id, acquisition_date, sale_date, shares, proceeds,
                 broker_reported_basis, correct_basis, adjustment_amount,
                 adjustment_code, holding_period, form_8949_category,
@@ -272,6 +278,142 @@ class TaxRepository:
             ),
         )
         self.conn.commit()
+
+    def get_sale_results(self, tax_year: int | None = None) -> list[dict]:
+        """Retrieve sale results, optionally filtered by tax year."""
+        if tax_year:
+            cursor = self.conn.execute(
+                "SELECT * FROM sale_results WHERE sale_date LIKE ?",
+                (f"{tax_year}-%",),
+            )
+        else:
+            cursor = self.conn.execute("SELECT * FROM sale_results")
+        columns = [desc[0] for desc in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    def clear_sale_results(self, tax_year: int) -> int:
+        """Delete all sale results for a tax year. Returns count deleted."""
+        cursor = self.conn.execute(
+            "DELETE FROM sale_results WHERE sale_date LIKE ?",
+            (f"{tax_year}-%",),
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
+    # --- Sales queries ---
+
+    def get_sales(self, tax_year: int | None = None) -> list[dict]:
+        """Retrieve sales, optionally filtered by tax year."""
+        if tax_year:
+            cursor = self.conn.execute(
+                "SELECT * FROM sales WHERE sale_date LIKE ?",
+                (f"{tax_year}-%",),
+            )
+        else:
+            cursor = self.conn.execute("SELECT * FROM sales")
+        columns = [desc[0] for desc in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    # --- Events queries ---
+
+    def get_events(
+        self, ticker: str | None = None, equity_type: str | None = None
+    ) -> list[dict]:
+        """Retrieve equity events with optional filters."""
+        query = "SELECT * FROM equity_events"
+        params: list[str] = []
+        conditions = []
+        if ticker:
+            conditions.append("ticker = ?")
+            params.append(ticker)
+        if equity_type:
+            conditions.append("equity_type = ?")
+            params.append(equity_type)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        cursor = self.conn.execute(query, params)
+        columns = [desc[0] for desc in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    # --- Lot updates ---
+
+    def update_lot_shares_remaining(
+        self, lot_id: str, shares_remaining: Decimal
+    ) -> None:
+        """Update the shares_remaining for a lot after allocation."""
+        self.conn.execute(
+            "UPDATE lots SET shares_remaining = ? WHERE id = ?",
+            (str(shares_remaining), lot_id),
+        )
+        self.conn.commit()
+
+    # --- Audit log ---
+
+    def save_audit_entry(self, entry: AuditEntry) -> None:
+        """Insert an audit log entry."""
+        self.conn.execute(
+            """INSERT INTO audit_log (engine, operation, inputs, output, notes)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                entry.engine,
+                entry.operation,
+                json.dumps(entry.inputs, default=str),
+                json.dumps(entry.output, default=str),
+                entry.notes,
+            ),
+        )
+        self.conn.commit()
+
+    # --- Reconciliation runs ---
+
+    def save_reconciliation_run(self, run: dict) -> str:
+        """Insert a reconciliation run record. Returns the run ID."""
+        run_id = run.get("id", str(uuid4()))
+        self.conn.execute(
+            """INSERT INTO reconciliation_runs
+               (id, tax_year, total_sales, matched_sales, unmatched_sales,
+                total_proceeds, total_correct_basis, total_gain_loss,
+                total_ordinary_income, total_amt_adjustment,
+                warnings, errors, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                run_id,
+                run["tax_year"],
+                run.get("total_sales", 0),
+                run.get("matched_sales", 0),
+                run.get("unmatched_sales", 0),
+                run.get("total_proceeds"),
+                run.get("total_correct_basis"),
+                run.get("total_gain_loss"),
+                run.get("total_ordinary_income"),
+                run.get("total_amt_adjustment"),
+                json.dumps(run.get("warnings", [])),
+                json.dumps(run.get("errors", [])),
+                run.get("status", "completed"),
+            ),
+        )
+        self.conn.commit()
+        return run_id
+
+    def get_reconciliation_runs(self, tax_year: int | None = None) -> list[dict]:
+        """Retrieve reconciliation runs, optionally filtered by tax year."""
+        if tax_year:
+            cursor = self.conn.execute(
+                "SELECT * FROM reconciliation_runs WHERE tax_year = ?",
+                (tax_year,),
+            )
+        else:
+            cursor = self.conn.execute("SELECT * FROM reconciliation_runs")
+        columns = [desc[0] for desc in cursor.description]
+        rows = []
+        for row in cursor.fetchall():
+            record = dict(zip(columns, row))
+            if record.get("warnings"):
+                record["warnings"] = json.loads(record["warnings"])
+            if record.get("errors"):
+                record["errors"] = json.loads(record["errors"])
+            rows.append(record)
+        return rows
 
     # --- Duplicate detection ---
 

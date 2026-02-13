@@ -56,6 +56,7 @@ class EquityEvent(BaseModel):
     strike_price: Decimal | None = None
     purchase_price: Decimal | None = None
     offering_date: date | None = None
+    fmv_on_offering_date: Decimal | None = None
     grant_date: date | None = None
     ordinary_income: Decimal | None = None
     broker_source: BrokerSource

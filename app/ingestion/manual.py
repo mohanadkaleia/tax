@@ -276,6 +276,7 @@ class ManualAdapter(BaseAdapter):
                 price_per_share=form.fmv_on_purchase_date,
                 purchase_price=form.purchase_price_per_share,
                 offering_date=form.offering_date,
+                fmv_on_offering_date=form.fmv_on_offering_date,
                 broker_source=BrokerSource.MANUAL,
             )
             events.append(event)

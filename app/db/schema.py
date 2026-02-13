@@ -3,7 +3,7 @@
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS equity_events (
     strike_price TEXT,
     purchase_price TEXT,
     offering_date TEXT,
+    fmv_on_offering_date TEXT,
     grant_date TEXT,
     ordinary_income TEXT,
     broker_source TEXT NOT NULL,
@@ -62,6 +63,7 @@ CREATE TABLE IF NOT EXISTS sales (
     id TEXT PRIMARY KEY,
     lot_id TEXT REFERENCES lots(id),
     ticker TEXT NOT NULL,
+    security_name TEXT,
     sale_date TEXT NOT NULL,
     shares TEXT NOT NULL,
     proceeds_per_share TEXT NOT NULL,
@@ -75,7 +77,8 @@ CREATE TABLE IF NOT EXISTS sales (
 );
 
 CREATE TABLE IF NOT EXISTS sale_results (
-    sale_id TEXT PRIMARY KEY REFERENCES sales(id),
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sale_id TEXT NOT NULL REFERENCES sales(id),
     lot_id TEXT REFERENCES lots(id),
     acquisition_date TEXT NOT NULL,
     sale_date TEXT NOT NULL,
@@ -138,6 +141,23 @@ CREATE TABLE IF NOT EXISTS form_1099int (
     federal_tax_withheld TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (import_batch_id) REFERENCES import_batches(id)
+);
+
+CREATE TABLE IF NOT EXISTS reconciliation_runs (
+    id TEXT PRIMARY KEY,
+    tax_year INTEGER NOT NULL,
+    run_at TEXT NOT NULL DEFAULT (datetime('now')),
+    total_sales INTEGER NOT NULL DEFAULT 0,
+    matched_sales INTEGER NOT NULL DEFAULT 0,
+    unmatched_sales INTEGER NOT NULL DEFAULT 0,
+    total_proceeds TEXT,
+    total_correct_basis TEXT,
+    total_gain_loss TEXT,
+    total_ordinary_income TEXT,
+    total_amt_adjustment TEXT,
+    warnings TEXT,
+    errors TEXT,
+    status TEXT NOT NULL DEFAULT 'completed'
 );
 
 CREATE TABLE IF NOT EXISTS audit_log (

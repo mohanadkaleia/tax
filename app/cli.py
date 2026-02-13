@@ -207,10 +207,57 @@ def import_data(
 @app.command()
 def reconcile(
     year: int = typer.Argument(..., help="Tax year to reconcile"),
+    db: Path = typer.Option(
+        Path.home() / ".taxbot" / "taxbot.db",
+        "--db",
+        help="Path to the SQLite database file",
+    ),
 ) -> None:
     """Run basis correction and reconciliation for a tax year."""
+    from app.db.repository import TaxRepository
+    from app.db.schema import create_schema
+    from app.engines.reconciliation import ReconciliationEngine
+
+    if not db.exists():
+        typer.echo("Error: No database found. Import data first with `taxbot import-data`.", err=True)
+        raise typer.Exit(1)
+
+    conn = create_schema(db)
+    repo = TaxRepository(conn)
+    engine = ReconciliationEngine(repo)
+
     typer.echo(f"Reconciling tax year {year}...")
-    typer.echo("Reconciliation not yet implemented.")
+    run = engine.reconcile(year)
+    conn.close()
+
+    # Print summary
+    typer.echo("\nReconciliation complete:")
+    typer.echo(f"  Total sales:     {run['total_sales']}")
+    typer.echo(f"  Matched:         {run['matched_sales']}")
+    typer.echo(f"  Unmatched:       {run['unmatched_sales']}")
+    typer.echo(f"  Total proceeds:  ${run.get('total_proceeds', '0')}")
+    typer.echo(f"  Correct basis:   ${run.get('total_correct_basis', '0')}")
+    typer.echo(f"  Gain/Loss:       ${run.get('total_gain_loss', '0')}")
+
+    ordinary = run.get("total_ordinary_income", "0")
+    if ordinary and ordinary != "0":
+        typer.echo(f"  Ordinary income: ${ordinary}")
+
+    amt = run.get("total_amt_adjustment", "0")
+    if amt and amt != "0":
+        typer.echo(f"  AMT adjustment:  ${amt}")
+
+    if run.get("warnings"):
+        typer.echo("\nWarnings:")
+        for w in run["warnings"]:
+            typer.echo(f"  - {w}")
+
+    if run.get("errors"):
+        typer.echo("\nErrors:")
+        for e in run["errors"]:
+            typer.echo(f"  - {e}")
+
+    typer.echo(f"\nStatus: {run['status']}")
 
 
 @app.command()

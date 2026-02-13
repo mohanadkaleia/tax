@@ -5,6 +5,7 @@ from app.engines.espp import ESPPEngine
 from app.engines.estimator import TaxEstimator
 from app.engines.iso_amt import ISOAMTEngine
 from app.engines.lot_matcher import LotMatcher
+from app.engines.reconciliation import ReconciliationEngine
 from app.engines.strategy import StrategyEngine
 
 __all__ = [
@@ -12,6 +13,7 @@ __all__ = [
     "ESPPEngine",
     "ISOAMTEngine",
     "LotMatcher",
+    "ReconciliationEngine",
     "StrategyEngine",
     "TaxEstimator",
 ]
