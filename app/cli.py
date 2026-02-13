@@ -263,10 +263,133 @@ def reconcile(
 @app.command()
 def estimate(
     year: int = typer.Argument(..., help="Tax year to estimate"),
+    filing_status: str = typer.Option(
+        "SINGLE",
+        "--filing-status",
+        "-s",
+        help="Filing status: SINGLE, MFJ, MFS, HOH",
+    ),
+    db: Path = typer.Option(
+        Path.home() / ".taxbot" / "taxbot.db",
+        "--db",
+        help="Path to the SQLite database file",
+    ),
+    federal_estimated: float = typer.Option(
+        0.0,
+        "--federal-estimated",
+        help="Federal estimated tax payments already made",
+    ),
+    state_estimated: float = typer.Option(
+        0.0,
+        "--state-estimated",
+        help="State estimated tax payments already made",
+    ),
+    itemized: float | None = typer.Option(
+        None,
+        "--itemized",
+        help="Total itemized deductions (omit to use standard deduction)",
+    ),
 ) -> None:
     """Compute estimated tax liability for a tax year."""
-    typer.echo(f"Estimating tax for year {year}...")
-    typer.echo("Estimation not yet implemented.")
+    from app.db.repository import TaxRepository
+    from app.db.schema import create_schema
+    from app.engines.estimator import TaxEstimator
+    from app.models.enums import FilingStatus
+
+    # Validate filing status
+    status_map = {"SINGLE": "SINGLE", "MFJ": "MARRIED_FILING_JOINTLY",
+                  "MFS": "MARRIED_FILING_SEPARATELY", "HOH": "HEAD_OF_HOUSEHOLD"}
+    fs_key = filing_status.upper()
+    fs_value = status_map.get(fs_key, fs_key)
+    try:
+        fs = FilingStatus(fs_value)
+    except ValueError:
+        valid = ", ".join(status_map.keys())
+        typer.echo(f"Error: Invalid filing status '{filing_status}'. Valid: {valid}", err=True)
+        raise typer.Exit(1)
+
+    if not db.exists():
+        typer.echo("Error: No database found. Import data first with `taxbot import-data`.", err=True)
+        raise typer.Exit(1)
+
+    conn = create_schema(db)
+    repo = TaxRepository(conn)
+    engine = TaxEstimator()
+
+    fed_est = Decimal(str(federal_estimated))
+    state_est = Decimal(str(state_estimated))
+    itemized_dec = Decimal(str(itemized)) if itemized is not None else None
+
+    typer.echo(f"Estimating tax for year {year} (filing status: {fs_key})...")
+    result = engine.estimate_from_db(
+        repo=repo,
+        tax_year=year,
+        filing_status=fs,
+        federal_estimated_payments=fed_est,
+        state_estimated_payments=state_est,
+        itemized_deductions=itemized_dec,
+    )
+    conn.close()
+
+    typer.echo("")
+    typer.echo(f"=== Tax Estimate: {year} ({fs_key}) ===")
+    typer.echo("")
+    typer.echo("INCOME")
+    typer.echo(f"  W-2 Wages:             ${result.w2_wages:>12,.2f}")
+    typer.echo(f"  Interest Income:       ${result.interest_income:>12,.2f}")
+    typer.echo(f"  Dividend Income:       ${result.dividend_income:>12,.2f}")
+    typer.echo(f"    (Qualified:          ${result.qualified_dividends:>12,.2f})")
+    typer.echo(f"  Short-Term Gains:      ${result.short_term_gains:>12,.2f}")
+    typer.echo(f"  Long-Term Gains:       ${result.long_term_gains:>12,.2f}")
+    typer.echo("  ──────────────────────────────────────")
+    typer.echo(f"  Total Income:          ${result.total_income:>12,.2f}")
+    typer.echo(f"  AGI:                   ${result.agi:>12,.2f}")
+    typer.echo("")
+    typer.echo("DEDUCTIONS")
+    typer.echo(f"  Standard Deduction:    ${result.standard_deduction:>12,.2f}")
+    if result.itemized_deductions:
+        typer.echo(f"  Itemized Deductions:   ${result.itemized_deductions:>12,.2f}")
+    typer.echo(f"  Deduction Used:        ${result.deduction_used:>12,.2f}")
+    typer.echo(f"  Taxable Income:        ${result.taxable_income:>12,.2f}")
+    typer.echo("")
+    typer.echo("FEDERAL TAX")
+    typer.echo(f"  Ordinary Income Tax:   ${result.federal_regular_tax:>12,.2f}")
+    typer.echo(f"  LTCG/QDiv Tax:         ${result.federal_ltcg_tax:>12,.2f}")
+    typer.echo(f"  NIIT (3.8%):           ${result.federal_niit:>12,.2f}")
+    typer.echo(f"  AMT:                   ${result.federal_amt:>12,.2f}")
+    typer.echo("  ──────────────────────────────────────")
+    typer.echo(f"  Total Federal Tax:     ${result.federal_total_tax:>12,.2f}")
+    typer.echo(f"  Federal Withheld:      ${result.federal_withheld:>12,.2f}")
+    if result.federal_estimated_payments > 0:
+        typer.echo(f"  Est. Payments:         ${result.federal_estimated_payments:>12,.2f}")
+    typer.echo(f"  Federal Balance Due:   ${result.federal_balance_due:>12,.2f}")
+    typer.echo("")
+    typer.echo("CALIFORNIA TAX")
+    typer.echo(f"  CA Taxable Income:     ${result.ca_taxable_income:>12,.2f}")
+    typer.echo(f"  CA Income Tax:         ${result.ca_tax:>12,.2f}")
+    typer.echo(f"  Mental Health Tax:     ${result.ca_mental_health_tax:>12,.2f}")
+    typer.echo("  ──────────────────────────────────────")
+    typer.echo(f"  Total CA Tax:          ${result.ca_total_tax:>12,.2f}")
+    typer.echo(f"  CA Withheld:           ${result.ca_withheld:>12,.2f}")
+    if result.ca_estimated_payments > 0:
+        typer.echo(f"  Est. Payments:         ${result.ca_estimated_payments:>12,.2f}")
+    typer.echo(f"  CA Balance Due:        ${result.ca_balance_due:>12,.2f}")
+    typer.echo("")
+    typer.echo("TOTAL")
+    typer.echo(f"  Total Tax:             ${result.total_tax:>12,.2f}")
+    typer.echo(f"  Total Withheld:        ${result.total_withheld:>12,.2f}")
+    typer.echo("  ══════════════════════════════════════")
+
+    if result.total_balance_due > 0:
+        typer.echo(f"  BALANCE DUE:           ${result.total_balance_due:>12,.2f}")
+    else:
+        typer.echo(f"  REFUND:                ${abs(result.total_balance_due):>12,.2f}")
+
+    if engine.warnings:
+        typer.echo("")
+        typer.echo("WARNINGS:")
+        for w in engine.warnings:
+            typer.echo(f"  - {w}")
 
 
 @app.command()

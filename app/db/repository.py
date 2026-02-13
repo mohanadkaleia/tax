@@ -148,6 +148,26 @@ class TaxRepository:
         self.conn.commit()
         return record_id
 
+    # --- 1099-DIV queries ---
+
+    def get_1099divs(self, tax_year: int) -> list[dict]:
+        """Retrieve 1099-DIV records for a given tax year."""
+        cursor = self.conn.execute(
+            "SELECT * FROM form_1099div WHERE tax_year = ?", (tax_year,)
+        )
+        columns = [desc[0] for desc in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    # --- 1099-INT queries ---
+
+    def get_1099ints(self, tax_year: int) -> list[dict]:
+        """Retrieve 1099-INT records for a given tax year."""
+        cursor = self.conn.execute(
+            "SELECT * FROM form_1099int WHERE tax_year = ?", (tax_year,)
+        )
+        columns = [desc[0] for desc in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
     # --- Lots ---
 
     def save_lot(self, lot: Lot, batch_id: str | None = None) -> None:
