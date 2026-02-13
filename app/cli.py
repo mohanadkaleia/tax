@@ -395,10 +395,149 @@ def estimate(
 @app.command()
 def strategy(
     year: int = typer.Argument(..., help="Tax year for strategy analysis"),
+    filing_status: str = typer.Option(
+        "SINGLE",
+        "--filing-status",
+        "-s",
+        help="Filing status: SINGLE, MFJ, MFS, HOH",
+    ),
+    db: Path = typer.Option(
+        Path.home() / ".taxbot" / "taxbot.db",
+        "--db",
+        help="Path to the SQLite database file",
+    ),
+    age: int | None = typer.Option(None, "--age", help="Taxpayer age (for catch-up contributions)"),
+    prices_file: Path | None = typer.Option(
+        None, "--prices", help="JSON file with current market prices: {ticker: price}",
+    ),
+    charitable: float = typer.Option(0, "--charitable", help="Annual charitable giving amount"),
+    property_tax: float = typer.Option(0, "--property-tax", help="Annual property tax"),
+    mortgage_interest: float = typer.Option(0, "--mortgage-interest", help="Annual mortgage interest"),
+    prior_year_tax: float | None = typer.Option(
+        None, "--prior-year-tax", help="Prior year total federal tax (for safe harbor)",
+    ),
+    prior_year_state_tax: float | None = typer.Option(
+        None, "--prior-year-state-tax", help="Prior year total CA state tax",
+    ),
+    amt_credit: float = typer.Option(0, "--amt-credit", help="AMT credit carryforward"),
+    loss_carryforward: float = typer.Option(0, "--loss-carryforward", help="Capital loss carryforward"),
+    projected_income: float | None = typer.Option(
+        None, "--projected-income", help="Projected W-2 income next year",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+    top_n: int = typer.Option(10, "--top", "-n", help="Show top N recommendations"),
 ) -> None:
     """Run tax strategy analysis and recommendations."""
-    typer.echo(f"Analyzing tax strategies for year {year}...")
-    typer.echo("Strategy analysis not yet implemented.")
+    from app.db.repository import TaxRepository
+    from app.db.schema import create_schema
+    from app.engines.strategy import StrategyEngine, UserInputs
+    from app.models.enums import FilingStatus
+
+    # Validate filing status
+    status_map = {"SINGLE": "SINGLE", "MFJ": "MARRIED_FILING_JOINTLY",
+                  "MFS": "MARRIED_FILING_SEPARATELY", "HOH": "HEAD_OF_HOUSEHOLD"}
+    fs_key = filing_status.upper()
+    fs_value = status_map.get(fs_key, fs_key)
+    try:
+        fs = FilingStatus(fs_value)
+    except ValueError:
+        valid = ", ".join(status_map.keys())
+        typer.echo(f"Error: Invalid filing status '{filing_status}'. Valid: {valid}", err=True)
+        raise typer.Exit(1)
+
+    if not db.exists():
+        typer.echo("Error: No database found. Import data first with `taxbot import-data`.", err=True)
+        raise typer.Exit(1)
+
+    conn = create_schema(db)
+    repo = TaxRepository(conn)
+
+    # Load market prices from JSON file if provided
+    market_prices: dict[str, Decimal] = {}
+    if prices_file and prices_file.exists():
+        with open(prices_file) as f:
+            raw_prices = json.load(f)
+            market_prices = {k: Decimal(str(v)) for k, v in raw_prices.items()}
+
+    user_inputs = UserInputs(
+        age=age,
+        annual_charitable_giving=Decimal(str(charitable)),
+        property_tax=Decimal(str(property_tax)),
+        mortgage_interest=Decimal(str(mortgage_interest)),
+        prior_year_federal_tax=Decimal(str(prior_year_tax)) if prior_year_tax is not None else None,
+        prior_year_state_tax=Decimal(str(prior_year_state_tax)) if prior_year_state_tax is not None else None,
+        amt_credit_carryforward=Decimal(str(amt_credit)),
+        capital_loss_carryforward=Decimal(str(loss_carryforward)),
+        projected_income_next_year=Decimal(str(projected_income)) if projected_income is not None else None,
+        current_market_prices=market_prices,
+    )
+
+    typer.echo(f"Analyzing tax strategies for year {year} (filing status: {fs_key})...")
+    engine = StrategyEngine()
+    report = engine.analyze(
+        repo=repo,
+        tax_year=year,
+        filing_status=fs,
+        user_inputs=user_inputs,
+    )
+    conn.close()
+
+    if json_output:
+        typer.echo(json.dumps(report.model_dump(), cls=_DecimalEncoder, indent=2, default=str))
+        return
+
+    # Formatted output
+    typer.echo("")
+    typer.echo(f"=== Tax Strategy Analysis: {year} ({fs_key}) ===")
+    typer.echo("")
+    b = report.baseline_estimate
+    typer.echo(f"Baseline Tax: ${b.total_tax:>12,.2f} "
+               f"(Federal: ${b.federal_total_tax:,.2f} + California: ${b.ca_total_tax:,.2f})")
+    typer.echo(f"Total Potential Savings: ${report.total_potential_savings:>12,.2f}")
+    typer.echo("")
+
+    recs = report.recommendations[:top_n]
+    if not recs:
+        typer.echo("No strategy recommendations generated.")
+        typer.echo("Provide additional data (--prices, --age, --prior-year-tax) for more strategies.")
+    else:
+        typer.echo(f" {'#':>2} | {'Priority':<8} | {'Strategy':<40} | {'Savings':>10} | {'Deadline':<12}")
+        typer.echo(f"{'---':>4}|{'-'*10}|{'-'*42}|{'-'*12}|{'-'*14}")
+        for i, rec in enumerate(recs, 1):
+            savings_str = f"${rec.estimated_savings:,.0f}" if rec.estimated_savings > 0 else "(info)"
+            deadline_str = str(rec.deadline) if rec.deadline else "(ongoing)"
+            typer.echo(
+                f" {i:>2} | {rec.priority.value:<8} | {rec.name:<40} | {savings_str:>10} | {deadline_str:<12}"
+            )
+
+        typer.echo("")
+        typer.echo("DETAILS:")
+        for i, rec in enumerate(recs, 1):
+            typer.echo("")
+            typer.echo(f"[{i}] {rec.priority.value}: {rec.name}")
+            typer.echo(f"    Situation: {rec.situation}")
+            typer.echo(f"    Mechanism: {rec.mechanism}")
+            typer.echo(f"    Impact: {rec.quantified_impact}")
+            if rec.action_steps:
+                typer.echo("    Action Steps:")
+                for step in rec.action_steps:
+                    typer.echo(f"      - {step}")
+            if rec.california_impact:
+                typer.echo(f"    CA Impact: {rec.california_impact}")
+            if rec.irs_authority:
+                typer.echo(f"    Authority: {rec.irs_authority}")
+
+    if report.warnings:
+        typer.echo("")
+        typer.echo("WARNINGS:")
+        for w in report.warnings:
+            typer.echo(f"  - {w}")
+
+    typer.echo("")
+    typer.echo("DATA COMPLETENESS:")
+    for key, available in report.data_completeness.items():
+        marker = "x" if available else " "
+        typer.echo(f"  [{marker}] {key.replace('_', ' ').title()}")
 
 
 @app.command()
