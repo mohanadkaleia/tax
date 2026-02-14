@@ -108,8 +108,10 @@ class TaxRepository:
             """INSERT INTO form_1099div
                (id, import_batch_id, tax_year, payer_name,
                 ordinary_dividends, qualified_dividends,
-                capital_gain_distributions, federal_tax_withheld)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                capital_gain_distributions, nondividend_distributions,
+                section_199a_dividends, foreign_tax_paid, foreign_country,
+                federal_tax_withheld, state_tax_withheld)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 record_id,
                 batch_id,
@@ -118,7 +120,12 @@ class TaxRepository:
                 str(form.ordinary_dividends),
                 str(form.qualified_dividends),
                 str(form.total_capital_gain_distributions),
+                str(form.nondividend_distributions),
+                str(form.section_199a_dividends),
+                str(form.foreign_tax_paid),
+                form.foreign_country,
                 str(form.federal_tax_withheld),
+                str(form.state_tax_withheld),
             ),
         )
         self.conn.commit()
@@ -132,17 +139,20 @@ class TaxRepository:
         self.conn.execute(
             """INSERT INTO form_1099int
                (id, import_batch_id, tax_year, payer_name,
-                interest_income, early_withdrawal_penalty,
-                federal_tax_withheld)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                interest_income, us_savings_bond_interest,
+                early_withdrawal_penalty,
+                federal_tax_withheld, state_tax_withheld)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 record_id,
                 batch_id,
                 form.tax_year,
                 form.payer_name,
                 str(form.interest_income),
+                str(form.us_savings_bond_interest),
                 str(form.early_withdrawal_penalty),
                 str(form.federal_tax_withheld),
+                str(form.state_tax_withheld),
             ),
         )
         self.conn.commit()

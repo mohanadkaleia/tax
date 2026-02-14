@@ -3,7 +3,7 @@
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -126,7 +126,12 @@ CREATE TABLE IF NOT EXISTS form_1099div (
     ordinary_dividends TEXT NOT NULL,
     qualified_dividends TEXT NOT NULL,
     capital_gain_distributions TEXT,
+    nondividend_distributions TEXT DEFAULT '0',
+    section_199a_dividends TEXT DEFAULT '0',
+    foreign_tax_paid TEXT DEFAULT '0',
+    foreign_country TEXT,
     federal_tax_withheld TEXT,
+    state_tax_withheld TEXT DEFAULT '0',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (import_batch_id) REFERENCES import_batches(id)
 );
@@ -137,8 +142,10 @@ CREATE TABLE IF NOT EXISTS form_1099int (
     tax_year INTEGER NOT NULL,
     payer_name TEXT,
     interest_income TEXT NOT NULL,
+    us_savings_bond_interest TEXT DEFAULT '0',
     early_withdrawal_penalty TEXT,
     federal_tax_withheld TEXT,
+    state_tax_withheld TEXT DEFAULT '0',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (import_batch_id) REFERENCES import_batches(id)
 );

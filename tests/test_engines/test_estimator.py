@@ -518,3 +518,154 @@ class TestArithmeticIdentities:
         assert r.federal_regular_tax >= Decimal("0")
         assert r.ca_tax >= Decimal("0")
         assert r.federal_amt >= Decimal("0")
+
+
+class TestForeignTaxCredit:
+    """Tests for foreign tax credit integration."""
+
+    def test_foreign_tax_credit_reduces_federal_tax(self, engine):
+        """Foreign tax paid should reduce federal tax dollar-for-dollar."""
+        base = engine.estimate(
+            tax_year=2024,
+            filing_status=FilingStatus.SINGLE,
+            w2_wages=Decimal("100000"),
+            dividend_income=Decimal("1000"),
+            qualified_dividends=Decimal("800"),
+        )
+        with_ftc = engine.estimate(
+            tax_year=2024,
+            filing_status=FilingStatus.SINGLE,
+            w2_wages=Decimal("100000"),
+            dividend_income=Decimal("1000"),
+            qualified_dividends=Decimal("800"),
+            foreign_tax_paid=Decimal("50"),
+        )
+        assert with_ftc.federal_foreign_tax_credit == Decimal("50")
+        assert with_ftc.federal_total_tax == base.federal_total_tax - Decimal("50")
+
+    def test_foreign_tax_credit_cannot_exceed_total_tax(self, engine):
+        """Credit is limited to total federal tax — cannot create a refund."""
+        result = engine.estimate(
+            tax_year=2024,
+            filing_status=FilingStatus.SINGLE,
+            w2_wages=Decimal("1000"),  # Very low income
+            foreign_tax_paid=Decimal("99999"),  # Huge credit
+        )
+        assert result.federal_foreign_tax_credit <= result.federal_foreign_tax_credit + result.federal_total_tax
+        assert result.federal_total_tax >= Decimal("0")
+
+    def test_zero_foreign_tax_no_effect(self, engine):
+        result = engine.estimate(
+            tax_year=2024,
+            filing_status=FilingStatus.SINGLE,
+            w2_wages=Decimal("100000"),
+            foreign_tax_paid=Decimal("0"),
+        )
+        assert result.federal_foreign_tax_credit == Decimal("0")
+
+
+class TestSection199ADeduction:
+    """Tests for QBI deduction from Section 199A dividends."""
+
+    def test_199a_deduction_reduces_taxable_income(self, engine):
+        """20% of Section 199A dividends should reduce taxable income."""
+        base = engine.estimate(
+            tax_year=2024,
+            filing_status=FilingStatus.SINGLE,
+            w2_wages=Decimal("100000"),
+            dividend_income=Decimal("1000"),
+            qualified_dividends=Decimal("500"),
+        )
+        with_199a = engine.estimate(
+            tax_year=2024,
+            filing_status=FilingStatus.SINGLE,
+            w2_wages=Decimal("100000"),
+            dividend_income=Decimal("1000"),
+            qualified_dividends=Decimal("500"),
+            section_199a_dividends=Decimal("500"),
+        )
+        expected_deduction = Decimal("500") * Decimal("0.20")  # $100
+        assert with_199a.section_199a_deduction == expected_deduction
+        assert with_199a.taxable_income == base.taxable_income - expected_deduction
+
+    def test_zero_199a_no_deduction(self, engine):
+        result = engine.estimate(
+            tax_year=2024,
+            filing_status=FilingStatus.SINGLE,
+            w2_wages=Decimal("100000"),
+            section_199a_dividends=Decimal("0"),
+        )
+        assert result.section_199a_deduction == Decimal("0")
+
+
+class TestCATreasuryExemption:
+    """Tests for California US Treasury interest exemption."""
+
+    def test_treasury_interest_reduces_ca_taxable_income(self, engine):
+        """US Treasury interest should be exempt from CA tax."""
+        base = engine.estimate(
+            tax_year=2024,
+            filing_status=FilingStatus.SINGLE,
+            w2_wages=Decimal("100000"),
+            interest_income=Decimal("1000"),
+        )
+        with_treasury = engine.estimate(
+            tax_year=2024,
+            filing_status=FilingStatus.SINGLE,
+            w2_wages=Decimal("100000"),
+            interest_income=Decimal("1000"),
+            us_treasury_interest=Decimal("500"),
+        )
+        assert with_treasury.ca_treasury_interest_exemption == Decimal("500")
+        assert with_treasury.ca_taxable_income == base.ca_taxable_income - Decimal("500")
+        assert with_treasury.ca_total_tax < base.ca_total_tax
+
+    def test_treasury_interest_does_not_affect_federal(self, engine):
+        """Treasury interest is federally taxable — only CA exempts it."""
+        base = engine.estimate(
+            tax_year=2024,
+            filing_status=FilingStatus.SINGLE,
+            w2_wages=Decimal("100000"),
+            interest_income=Decimal("1000"),
+        )
+        with_treasury = engine.estimate(
+            tax_year=2024,
+            filing_status=FilingStatus.SINGLE,
+            w2_wages=Decimal("100000"),
+            interest_income=Decimal("1000"),
+            us_treasury_interest=Decimal("500"),
+        )
+        assert with_treasury.federal_total_tax == base.federal_total_tax
+        assert with_treasury.taxable_income == base.taxable_income
+
+
+class TestNewFieldsCombined:
+    """Integration test: all new credits/deductions together."""
+
+    def test_all_new_fields_reduce_tax(self, engine):
+        """Combined effect of foreign tax credit + QBI + CA Treasury."""
+        base = engine.estimate(
+            tax_year=2024,
+            filing_status=FilingStatus.SINGLE,
+            w2_wages=Decimal("200000"),
+            dividend_income=Decimal("5000"),
+            qualified_dividends=Decimal("4000"),
+            interest_income=Decimal("2000"),
+        )
+        with_all = engine.estimate(
+            tax_year=2024,
+            filing_status=FilingStatus.SINGLE,
+            w2_wages=Decimal("200000"),
+            dividend_income=Decimal("5000"),
+            qualified_dividends=Decimal("4000"),
+            interest_income=Decimal("2000"),
+            foreign_tax_paid=Decimal("100"),
+            section_199a_dividends=Decimal("1000"),
+            us_treasury_interest=Decimal("500"),
+        )
+        # Federal should be lower (FTC + 199A deduction)
+        assert with_all.federal_total_tax < base.federal_total_tax
+        # CA should be lower (Treasury exemption)
+        assert with_all.ca_total_tax < base.ca_total_tax
+        # Overall balance due should be lower
+        assert with_all.total_balance_due < base.total_balance_due

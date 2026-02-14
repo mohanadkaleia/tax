@@ -356,6 +356,129 @@ class TestFormTypeDetection:
         )
 
 
+class TestParse1099DIVNewFields:
+    """Tests for newly added 1099-DIV fields."""
+
+    def test_parse_1099div_with_all_new_fields(self, adapter, tmp_path):
+        data = {
+            "tax_year": 2024,
+            "payer_name": "Robinhood",
+            "ordinary_dividends": "405.83",
+            "qualified_dividends": "392.12",
+            "capital_gain_distributions": "0.00",
+            "nondividend_distributions": "2.88",
+            "section_199a_dividends": "13.71",
+            "foreign_tax_paid": "12.21",
+            "foreign_country": "CA",
+            "federal_tax_withheld": "0.00",
+            "state_tax_withheld": "5.00",
+        }
+        f = tmp_path / "1099div.json"
+        f.write_text(json.dumps(data))
+        result = adapter.parse(f)
+        form = result.forms[0]
+
+        assert form.nondividend_distributions == Decimal("2.88")
+        assert form.section_199a_dividends == Decimal("13.71")
+        assert form.foreign_tax_paid == Decimal("12.21")
+        assert form.foreign_country == "CA"
+        assert form.state_tax_withheld == Decimal("5.00")
+
+    def test_parse_1099div_defaults_when_fields_missing(self, adapter, tmp_path):
+        """Backward compat: old JSON files without new fields should work."""
+        data = {
+            "tax_year": 2024,
+            "payer_name": "Vanguard",
+            "ordinary_dividends": "100.00",
+            "qualified_dividends": "80.00",
+        }
+        f = tmp_path / "1099div.json"
+        f.write_text(json.dumps(data))
+        result = adapter.parse(f)
+        form = result.forms[0]
+
+        assert form.nondividend_distributions == Decimal("0")
+        assert form.section_199a_dividends == Decimal("0")
+        assert form.foreign_tax_paid == Decimal("0")
+        assert form.foreign_country is None
+        assert form.state_tax_withheld == Decimal("0")
+
+    def test_validate_section_199a_exceeds_ordinary(self, adapter, tmp_path):
+        data = {
+            "tax_year": 2024,
+            "payer_name": "Fund",
+            "ordinary_dividends": "100.00",
+            "qualified_dividends": "50.00",
+            "section_199a_dividends": "200.00",  # Exceeds ordinary
+        }
+        f = tmp_path / "1099div.json"
+        f.write_text(json.dumps(data))
+        result = adapter.parse(f)
+        errors = adapter.validate(result)
+        assert any("section_199a_dividends" in e for e in errors)
+
+    def test_validate_negative_foreign_tax(self, adapter, tmp_path):
+        data = {
+            "tax_year": 2024,
+            "payer_name": "Fund",
+            "ordinary_dividends": "100.00",
+            "qualified_dividends": "50.00",
+            "foreign_tax_paid": "-5.00",
+        }
+        f = tmp_path / "1099div.json"
+        f.write_text(json.dumps(data))
+        result = adapter.parse(f)
+        errors = adapter.validate(result)
+        assert any("foreign_tax_paid" in e for e in errors)
+
+
+class TestParse1099INTNewFields:
+    """Tests for newly added 1099-INT fields."""
+
+    def test_parse_1099int_with_treasury_interest(self, adapter, tmp_path):
+        data = {
+            "tax_year": 2024,
+            "payer_name": "Schwab",
+            "interest_income": "500.00",
+            "us_savings_bond_interest": "200.00",
+            "state_tax_withheld": "10.00",
+        }
+        f = tmp_path / "1099int.json"
+        f.write_text(json.dumps(data))
+        result = adapter.parse(f)
+        form = result.forms[0]
+
+        assert form.us_savings_bond_interest == Decimal("200.00")
+        assert form.state_tax_withheld == Decimal("10.00")
+
+    def test_parse_1099int_defaults_when_fields_missing(self, adapter, tmp_path):
+        data = {
+            "tax_year": 2024,
+            "payer_name": "Chase",
+            "interest_income": "100.00",
+        }
+        f = tmp_path / "1099int.json"
+        f.write_text(json.dumps(data))
+        result = adapter.parse(f)
+        form = result.forms[0]
+
+        assert form.us_savings_bond_interest == Decimal("0")
+        assert form.state_tax_withheld == Decimal("0")
+
+    def test_validate_treasury_exceeds_total_interest(self, adapter, tmp_path):
+        data = {
+            "tax_year": 2024,
+            "payer_name": "Bank",
+            "interest_income": "100.00",
+            "us_savings_bond_interest": "200.00",  # Exceeds total
+        }
+        f = tmp_path / "1099int.json"
+        f.write_text(json.dumps(data))
+        result = adapter.parse(f)
+        errors = adapter.validate(result)
+        assert any("us_savings_bond_interest" in e for e in errors)
+
+
 class TestEdgeCases:
     def test_parse_file_not_found(self, adapter):
         with pytest.raises(FileNotFoundError):

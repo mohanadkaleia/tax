@@ -83,6 +83,10 @@ class Form1099DIV(BaseModel):
     ordinary_dividends: Decimal  # Box 1a
     qualified_dividends: Decimal  # Box 1b
     total_capital_gain_distributions: Decimal = Decimal("0")  # Box 2a
+    nondividend_distributions: Decimal = Decimal("0")  # Box 3
+    section_199a_dividends: Decimal = Decimal("0")  # Box 5
+    foreign_tax_paid: Decimal = Decimal("0")  # Box 6 (Box 7 on pre-2020 revisions)
+    foreign_country: str | None = None  # Box 7 (Box 8 on pre-2020 revisions)
     federal_tax_withheld: Decimal = Decimal("0")
     state_tax_withheld: Decimal = Decimal("0")
 
@@ -92,5 +96,6 @@ class Form1099INT(BaseModel):
     tax_year: int
     interest_income: Decimal  # Box 1
     early_withdrawal_penalty: Decimal = Decimal("0")  # Box 2
+    us_savings_bond_interest: Decimal = Decimal("0")  # Box 3
     federal_tax_withheld: Decimal = Decimal("0")
     state_tax_withheld: Decimal = Decimal("0")

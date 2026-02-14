@@ -716,6 +716,8 @@ def parse(
 
             typer.echo(f"Detected form type: {detected_type.value}")
 
+            max_tokens = max(4096, len(images) * 2048)
+            typer.echo(f"  Sending {len(images)} page(s) to Claude Vision (max_tokens={max_tokens})...")
             data = extractor_v.extract(images, detected_type)
         except VisionExtractionError as exc:
             typer.echo(f"Error: {exc}", err=True)

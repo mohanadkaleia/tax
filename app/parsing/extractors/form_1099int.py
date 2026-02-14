@@ -18,6 +18,9 @@ class Form1099INTExtractor(BasePDFExtractor):
     PENALTY_PATTERN = re.compile(
         r"(?:Box\s*2|2\s+[Ee]arly\s+withdrawal\s+penalty)[^\d$]*\$?([\d,]+\.\d{2})", re.IGNORECASE
     )
+    US_BOND_PATTERN = re.compile(
+        r"(?:Box\s*3|3\s+[Ii]nterest\s+on\s+U\.?S\.?\s+[Ss]avings\s+[Bb]onds)[^\d$]*\$?([\d,]+\.\d{2})", re.IGNORECASE
+    )
     FED_TAX_PATTERN = re.compile(
         r"(?:Box\s*4|4\s+[Ff]ederal\s*income\s*tax\s*withheld)[^\d$]*\$?([\d,]+\.\d{2})", re.IGNORECASE
     )
@@ -49,6 +52,13 @@ class Form1099INTExtractor(BasePDFExtractor):
             parsed = self._parse_decimal(match.group(1))
             if parsed is not None:
                 result["early_withdrawal_penalty"] = self._decimal_to_str(parsed)
+
+        # Box 3 - Interest on US Savings Bonds and Treasury obligations
+        match = self.US_BOND_PATTERN.search(text)
+        if match:
+            parsed = self._parse_decimal(match.group(1))
+            if parsed is not None:
+                result["us_savings_bond_interest"] = self._decimal_to_str(parsed)
 
         # Box 4 - Federal tax withheld
         match = self.FED_TAX_PATTERN.search(text)

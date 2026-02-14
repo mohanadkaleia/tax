@@ -15,12 +15,20 @@ Rules:
 - Be precise. Read each box label carefully and match values to the correct box number.
 """
 
-FORM_DETECTION_PROMPT = """Look at this tax document image and identify the form type.
+FORM_DETECTION_PROMPT = """Look at these tax document page(s) and identify the form type.
 
 Return JSON in this exact format:
 {"form_type": "<type>"}
 
 Where <type> is one of: "w2", "1099b", "1099div", "1099int", "3921", "3922"
+
+IMPORTANT: This may be a COMPOSITE brokerage statement (e.g., from Robinhood, Morgan Stanley,
+Schwab, Fidelity) that contains multiple form types (1099-B, 1099-DIV, 1099-INT) in one document.
+If you see a composite/consolidated tax statement:
+- If it contains 1099-B transaction data (proceeds, sales), return "1099b"
+- If it only contains dividend data, return "1099div"
+- If it only contains interest data, return "1099int"
+- The first page may be a summary or cover page — look at ALL provided pages to determine the type.
 
 If you cannot identify the form type, return:
 {"form_type": null}
@@ -72,9 +80,19 @@ Notes:
 - Include all boxes you can read, set missing ones to null.
 """
 
-FORM_1099B_PROMPT = """Extract all transaction records from this Form 1099-B (Proceeds From Broker) image.
+FORM_1099B_PROMPT = """Extract all transaction records from this Form 1099-B (Proceeds From Broker and Barter Exchange Transactions).
 
-Return a JSON array of transaction records:
+IMPORTANT: This may be a composite brokerage statement with multiple sections (short-term covered,
+short-term non-covered, long-term covered, long-term non-covered, etc.). Extract transactions from
+ALL sections — do NOT skip any section or page.
+
+Look for these common section headers and extract ALL transactions under each:
+- "Short-Term Transactions for Which Basis Is Reported to the IRS" (basis_reported_to_irs: true)
+- "Short-Term Transactions for Which Basis Is NOT Reported to the IRS" (basis_reported_to_irs: false)
+- "Long-Term Transactions for Which Basis Is Reported to the IRS" (basis_reported_to_irs: true)
+- "Long-Term Transactions for Which Basis Is NOT Reported to the IRS" (basis_reported_to_irs: false)
+
+Return a JSON array of ALL transaction records across ALL pages and sections:
 [
   {
     "tax_year": 2024,
@@ -91,11 +109,14 @@ Return a JSON array of transaction records:
 ]
 
 Notes:
-- Extract EVERY transaction row visible on the form.
+- Extract EVERY transaction row visible across ALL pages. Do not summarize or skip rows.
 - If date_acquired shows "Various" or "VARIOUS", use the string "Various".
-- cost_basis of "0.00" means the broker did not report basis.
-- basis_reported_to_irs: true if basis was reported to IRS, false otherwise.
+- cost_basis of "0.00" or missing means the broker did not report basis — set to null.
+- basis_reported_to_irs: set based on the section header (see above).
 - Set broker_source to "MANUAL" for all records.
+- The broker_name should be the brokerage firm name (e.g., "Morgan Stanley", "Robinhood", etc.).
+- For summary/total rows, do NOT include them — only extract individual transaction rows.
+- If a page contains 1099-DIV or 1099-INT sections, IGNORE those — only extract 1099-B transactions.
 """
 
 FORM_1099DIV_PROMPT = """Extract data from this Form 1099-DIV (Dividends and Distributions) image.
@@ -107,14 +128,24 @@ Return JSON in this exact format:
   "ordinary_dividends": "1234.56",
   "qualified_dividends": "987.65",
   "capital_gain_distributions": "500.00",
-  "federal_tax_withheld": "0.00"
+  "nondividend_distributions": "0.00",
+  "section_199a_dividends": "0.00",
+  "foreign_tax_paid": "0.00",
+  "foreign_country": null,
+  "federal_tax_withheld": "0.00",
+  "state_tax_withheld": "0.00"
 }
 
 Notes:
 - ordinary_dividends = Box 1a
 - qualified_dividends = Box 1b
 - capital_gain_distributions = Box 2a
+- nondividend_distributions = Box 3
+- section_199a_dividends = Box 5
+- foreign_tax_paid = Box 6 (Box 7 on older forms)
+- foreign_country = Box 7 (Box 8 on older forms)
 - federal_tax_withheld = Box 4
+- state_tax_withheld = Box 14 (state income tax withheld)
 - Set missing values to null.
 """
 
@@ -125,14 +156,18 @@ Return JSON in this exact format:
   "tax_year": 2024,
   "payer_name": "Bank Name",
   "interest_income": "456.78",
+  "us_savings_bond_interest": "0.00",
   "early_withdrawal_penalty": "0.00",
-  "federal_tax_withheld": "0.00"
+  "federal_tax_withheld": "0.00",
+  "state_tax_withheld": "0.00"
 }
 
 Notes:
 - interest_income = Box 1
 - early_withdrawal_penalty = Box 2
+- us_savings_bond_interest = Box 3 (Interest on US Savings Bonds and Treasury obligations)
 - federal_tax_withheld = Box 4
+- state_tax_withheld = Box 15 (state income tax withheld)
 - Set missing values to null.
 """
 

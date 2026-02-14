@@ -21,6 +21,18 @@ class Form1099DIVExtractor(BasePDFExtractor):
     CAP_GAIN_PATTERN = re.compile(
         r"(?:Box\s*2a|2a\s+(?:Total\s+)?[Cc]apital\s+gain)[^\d$]*\$?([\d,]+\.\d{2})", re.IGNORECASE
     )
+    NONDIV_DIST_PATTERN = re.compile(
+        r"(?:Box\s*3|3\s+[Nn]ondividend\s+distributions)[^\d$]*\$?([\d,]+\.\d{2})", re.IGNORECASE
+    )
+    SEC_199A_PATTERN = re.compile(
+        r"(?:Box\s*5|5\s+[Ss]ection\s*199A\s+dividends)[^\d$]*\$?([\d,]+\.\d{2})", re.IGNORECASE
+    )
+    FOREIGN_TAX_PATTERN = re.compile(
+        r"(?:Box\s*(?:6|7)|(?:6|7)\s+[Ff]oreign\s+tax\s+paid)[^\d$]*\$?([\d,]+\.\d{2})", re.IGNORECASE
+    )
+    FOREIGN_COUNTRY_PATTERN = re.compile(
+        r"(?:Box\s*(?:7|8)|(?:7|8)\s+[Ff]oreign\s+country)[^\d$]*\s+([A-Za-z\s]+?)(?:\n|$)", re.IGNORECASE
+    )
     FED_TAX_PATTERN = re.compile(
         r"(?:Box\s*4|4\s+[Ff]ederal\s*income\s*tax\s*withheld)[^\d$]*\$?([\d,]+\.\d{2})", re.IGNORECASE
     )
@@ -59,6 +71,34 @@ class Form1099DIVExtractor(BasePDFExtractor):
             parsed = self._parse_decimal(match.group(1))
             if parsed is not None:
                 result["total_capital_gain_distributions"] = self._decimal_to_str(parsed)
+
+        # Box 3 - Nondividend distributions
+        match = self.NONDIV_DIST_PATTERN.search(text)
+        if match:
+            parsed = self._parse_decimal(match.group(1))
+            if parsed is not None:
+                result["nondividend_distributions"] = self._decimal_to_str(parsed)
+
+        # Box 5 - Section 199A dividends
+        match = self.SEC_199A_PATTERN.search(text)
+        if match:
+            parsed = self._parse_decimal(match.group(1))
+            if parsed is not None:
+                result["section_199a_dividends"] = self._decimal_to_str(parsed)
+
+        # Box 7 (or Box 6) - Foreign tax paid
+        match = self.FOREIGN_TAX_PATTERN.search(text)
+        if match:
+            parsed = self._parse_decimal(match.group(1))
+            if parsed is not None:
+                result["foreign_tax_paid"] = self._decimal_to_str(parsed)
+
+        # Box 7 country (or Box 8) - Foreign country
+        match = self.FOREIGN_COUNTRY_PATTERN.search(text)
+        if match:
+            country = match.group(1).strip()
+            if country:
+                result["foreign_country"] = country
 
         # Box 4 - Federal tax withheld
         match = self.FED_TAX_PATTERN.search(text)

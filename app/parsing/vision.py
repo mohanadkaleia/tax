@@ -51,6 +51,53 @@ def _compress_image(pil_image, max_bytes: int = MAX_IMAGE_BYTES) -> bytes:
     return buf.getvalue()
 
 
+def _salvage_truncated_json_array(text: str) -> list | None:
+    """Attempt to recover complete JSON objects from a truncated array.
+
+    When the API response is cut off mid-stream, the JSON array may be
+    incomplete (e.g., "[{...}, {..." with no closing bracket).
+    This function finds the last complete object and closes the array.
+    """
+    # Find each complete top-level object in the array
+    depth = 0
+    last_complete_end = -1
+    in_string = False
+    escape_next = False
+
+    for i, ch in enumerate(text):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\":
+            escape_next = True
+            continue
+        if ch == '"' and not escape_next:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                last_complete_end = i
+
+    if last_complete_end <= 0:
+        return None
+
+    # Build a valid JSON array from complete objects only
+    salvaged = text[:last_complete_end + 1].rstrip().rstrip(",") + "]"
+    try:
+        result = json.loads(salvaged)
+        if isinstance(result, list) and len(result) > 0:
+            return result
+    except json.JSONDecodeError:
+        pass
+    return None
+
+
 class VisionExtractor:
     """Extracts structured data from tax form images using Claude Vision API."""
 
@@ -76,9 +123,16 @@ class VisionExtractor:
         return self._client
 
     def detect_form_type(self, images: list[bytes]) -> FormType | None:
-        """Detect the form type from page images using Claude Vision."""
+        """Detect the form type from page images using Claude Vision.
+
+        Sends up to the first 3 pages to handle composite brokerage statements
+        where page 1 is a summary/cover page.
+        """
+        # Send up to 3 pages for detection — composite docs (Robinhood, Morgan Stanley)
+        # have summary cover pages that don't clearly identify a single form type.
+        pages_to_check = images[:min(3, len(images))]
         response_text = self._call_claude_vision(
-            images[:1],  # First page is enough for detection
+            pages_to_check,
             SYSTEM_PROMPT,
             FORM_DETECTION_PROMPT,
         )
@@ -106,11 +160,20 @@ class VisionExtractor:
         if not prompt:
             raise VisionExtractionError("", f"No vision prompt defined for form type: {form_type.value}")
 
-        response_text = self._call_claude_vision(images, SYSTEM_PROMPT, prompt)
+        # Scale max_tokens based on page count — multi-page 1099-Bs need more room
+        max_tokens = max(4096, len(images) * 2048)
+
+        response_text = self._call_claude_vision(images, SYSTEM_PROMPT, prompt, max_tokens=max_tokens)
         result = self._parse_json_response(response_text)
 
         if result is None:
-            raise VisionExtractionError("", "Claude Vision returned no parseable JSON.")
+            # Log the raw response so we can diagnose extraction failures
+            logger.error("Vision extraction returned no parseable JSON. Raw response (first 2000 chars):\n%s",
+                         response_text[:2000])
+            raise VisionExtractionError(
+                "",
+                f"Claude Vision returned no parseable JSON. Response preview: {response_text[:300]}",
+            )
 
         return result
 
@@ -141,13 +204,20 @@ class VisionExtractor:
                 images.append(img_bytes)
         return images
 
-    def _call_claude_vision(self, images: list[bytes], system_prompt: str, user_prompt: str) -> str:
+    def _call_claude_vision(
+        self,
+        images: list[bytes],
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int = 4096,
+    ) -> str:
         """Call Claude Vision API with images and prompts, with retry logic.
 
         Args:
             images: PNG image bytes to send.
             system_prompt: System-level instructions.
             user_prompt: Form-specific extraction prompt.
+            max_tokens: Maximum tokens in the response.
 
         Returns:
             Raw text response from Claude.
@@ -167,19 +237,44 @@ class VisionExtractor:
             })
         content.append({"type": "text", "text": user_prompt})
 
+        # Use streaming for large requests (many pages) to avoid the 10-minute
+        # non-streaming timeout limit imposed by the Anthropic API.
+        use_streaming = len(images) > 5
+        logger.info("Calling Claude Vision with %d page(s), max_tokens=%d, streaming=%s",
+                     len(images), max_tokens, use_streaming)
+
+        msg_params = {
+            "model": self.MODEL,
+            "max_tokens": max_tokens,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": content}],
+        }
+
         last_error = None
         for attempt in range(MAX_RETRIES):
             try:
-                response = self.client.messages.create(
-                    model=self.MODEL,
-                    max_tokens=4096,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": content}],
-                )
-                return response.content[0].text
+                if use_streaming:
+                    response_text, stop_reason = self._stream_response(msg_params)
+                else:
+                    response = self.client.messages.create(**msg_params)
+                    response_text = response.content[0].text
+                    stop_reason = response.stop_reason
+
+                # Check if response was truncated due to max_tokens
+                if stop_reason == "max_tokens":
+                    logger.warning("Vision API response was truncated (hit max_tokens=%d). "
+                                   "Output may be incomplete.", max_tokens)
+                return response_text
             except Exception as exc:
                 last_error = exc
                 error_str = str(exc)
+
+                # If we hit the streaming requirement, retry with streaming
+                if "streaming is required" in error_str.lower() and not use_streaming:
+                    logger.info("Server requires streaming — retrying with streaming enabled")
+                    use_streaming = True
+                    continue
+
                 # Retry on rate limits (429) and server errors (5xx)
                 is_retryable = "429" in error_str or "500" in error_str or "502" in error_str or "503" in error_str
                 if is_retryable and attempt < MAX_RETRIES - 1:
@@ -192,9 +287,19 @@ class VisionExtractor:
 
         raise VisionExtractionError("", f"API call failed after {MAX_RETRIES} attempts: {last_error}")
 
+    def _stream_response(self, msg_params: dict) -> tuple[str, str]:
+        """Stream a response from the API and collect the full text.
+
+        Returns:
+            Tuple of (response_text, stop_reason).
+        """
+        with self.client.messages.stream(**msg_params) as stream:
+            response = stream.get_final_message()
+        return response.content[0].text, response.stop_reason
+
     @staticmethod
     def _parse_json_response(response_text: str) -> dict | list | None:
-        """Parse JSON from Claude's response, handling markdown fences.
+        """Parse JSON from Claude's response, handling markdown fences and truncation.
 
         Args:
             response_text: Raw text response from Claude.
@@ -216,13 +321,26 @@ class VisionExtractor:
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            # Try to find JSON object or array in the response
-            for start_char, end_char in [("{", "}"), ("[", "]")]:
-                start = text.find(start_char)
-                end = text.rfind(end_char)
-                if start != -1 and end != -1 and end > start:
-                    try:
-                        return json.loads(text[start:end + 1])
-                    except json.JSONDecodeError:
-                        continue
-            return None
+            pass
+
+        # Try to find JSON object or array in the response
+        for start_char, end_char in [("{", "}"), ("[", "]")]:
+            start = text.find(start_char)
+            end = text.rfind(end_char)
+            if start != -1 and end != -1 and end > start:
+                try:
+                    return json.loads(text[start:end + 1])
+                except json.JSONDecodeError:
+                    continue
+
+        # Handle truncated JSON arrays — response cut off mid-stream
+        # Find the start of a JSON array and try to salvage complete objects
+        array_start = text.find("[")
+        if array_start != -1:
+            truncated = text[array_start:]
+            result = _salvage_truncated_json_array(truncated)
+            if result is not None:
+                logger.warning("Salvaged %d complete records from truncated JSON response", len(result))
+                return result
+
+        return None

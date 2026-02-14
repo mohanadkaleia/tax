@@ -84,7 +84,8 @@ class TaxEstimate(BaseModel):
     long_term_gains: Decimal
     total_income: Decimal
     agi: Decimal
-    # Deductions
+    # Deductions & credits
+    section_199a_deduction: Decimal = Decimal("0")
     standard_deduction: Decimal
     itemized_deductions: Decimal | None = None
     deduction_used: Decimal
@@ -94,11 +95,13 @@ class TaxEstimate(BaseModel):
     federal_ltcg_tax: Decimal
     federal_niit: Decimal
     federal_amt: Decimal
+    federal_foreign_tax_credit: Decimal = Decimal("0")
     federal_total_tax: Decimal
     federal_withheld: Decimal
     federal_estimated_payments: Decimal = Decimal("0")
     federal_balance_due: Decimal
     # California
+    ca_treasury_interest_exemption: Decimal = Decimal("0")
     ca_taxable_income: Decimal
     ca_tax: Decimal
     ca_mental_health_tax: Decimal

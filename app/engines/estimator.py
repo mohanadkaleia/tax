@@ -53,6 +53,9 @@ class TaxEstimator:
         federal_estimated_payments: Decimal = Decimal("0"),
         state_estimated_payments: Decimal = Decimal("0"),
         itemized_deductions: Decimal | None = None,
+        section_199a_dividends: Decimal = Decimal("0"),
+        foreign_tax_paid: Decimal = Decimal("0"),
+        us_treasury_interest: Decimal = Decimal("0"),
     ) -> TaxEstimate:
         """Compute full tax estimate.
 
@@ -67,12 +70,17 @@ class TaxEstimator:
         )
         agi = total_income
 
+        # --- Section 199A QBI deduction (20% of qualified REIT/PTP dividends) ---
+        # This is a below-the-line deduction separate from standard/itemized.
+        # Available regardless of whether taxpayer itemizes.
+        section_199a_deduction = section_199a_dividends * Decimal("0.20")
+
         # --- Federal deductions ---
         std_ded = FEDERAL_STANDARD_DEDUCTION.get(tax_year, {}).get(
             filing_status, Decimal("14600")
         )
         deduction_used = max(itemized_deductions or Decimal("0"), std_ded)
-        taxable_income = max(agi - deduction_used, Decimal("0"))
+        taxable_income = max(agi - deduction_used - section_199a_deduction, Decimal("0"))
 
         # --- Split ordinary vs. preferential income ---
         preferential_income = max(
@@ -108,16 +116,25 @@ class TaxEstimator:
             tax_year=tax_year,
         )
 
+        # --- Foreign Tax Credit (IRC Section 901) ---
+        # For amounts <= $300 single / $600 MFJ, can be taken as a direct credit
+        # without Form 1116. Credit cannot exceed total tax.
+        federal_pre_credit = federal_regular + federal_ltcg + federal_niit + federal_amt
+        federal_foreign_tax_credit = min(foreign_tax_paid, federal_pre_credit)
+
         # --- Federal totals ---
-        federal_total = federal_regular + federal_ltcg + federal_niit + federal_amt
+        federal_total = federal_pre_credit - federal_foreign_tax_credit
         federal_balance = federal_total - federal_withheld - federal_estimated_payments
 
         # --- California ---
+        # US Treasury/savings bond interest is exempt from CA tax
+        # per CA Revenue & Taxation Code Section 17144
+        ca_treasury_exemption = us_treasury_interest
         ca_std_ded = CALIFORNIA_STANDARD_DEDUCTION.get(tax_year, {}).get(
             filing_status, Decimal("5540")
         )
         ca_deduction = max(itemized_deductions or Decimal("0"), ca_std_ded)
-        ca_taxable = max(agi - ca_deduction, Decimal("0"))
+        ca_taxable = max(agi - ca_deduction - ca_treasury_exemption, Decimal("0"))
         ca_tax = self.compute_california_tax(ca_taxable, filing_status, tax_year)
         ca_mh = (
             max(ca_taxable - CA_MENTAL_HEALTH_THRESHOLD, Decimal("0"))
@@ -137,6 +154,7 @@ class TaxEstimator:
             long_term_gains=long_term_gains,
             total_income=total_income,
             agi=agi,
+            section_199a_deduction=section_199a_deduction,
             standard_deduction=std_ded,
             itemized_deductions=itemized_deductions,
             deduction_used=deduction_used,
@@ -145,10 +163,12 @@ class TaxEstimator:
             federal_ltcg_tax=federal_ltcg,
             federal_niit=federal_niit,
             federal_amt=federal_amt,
+            federal_foreign_tax_credit=federal_foreign_tax_credit,
             federal_total_tax=federal_total,
             federal_withheld=federal_withheld,
             federal_estimated_payments=federal_estimated_payments,
             federal_balance_due=federal_balance,
+            ca_treasury_interest_exemption=ca_treasury_exemption,
             ca_taxable_income=ca_taxable,
             ca_tax=ca_tax,
             ca_mental_health_tax=ca_mh,
@@ -196,19 +216,32 @@ class TaxEstimator:
         div_records = repo.get_1099divs(tax_year)
         dividend_income = Decimal("0")
         qualified_dividends = Decimal("0")
+        section_199a_dividends = Decimal("0")
+        foreign_tax_paid = Decimal("0")
         for div in div_records:
             dividend_income += Decimal(str(div["ordinary_dividends"]))
             qualified_dividends += Decimal(str(div["qualified_dividends"]))
+            if div.get("section_199a_dividends"):
+                section_199a_dividends += Decimal(str(div["section_199a_dividends"]))
+            if div.get("foreign_tax_paid"):
+                foreign_tax_paid += Decimal(str(div["foreign_tax_paid"]))
             if div.get("federal_tax_withheld"):
                 federal_withheld += Decimal(str(div["federal_tax_withheld"]))
+            if div.get("state_tax_withheld"):
+                state_withheld += Decimal(str(div["state_tax_withheld"]))
 
         # --- 1099-INT aggregation ---
         int_records = repo.get_1099ints(tax_year)
         interest_income = Decimal("0")
+        us_treasury_interest = Decimal("0")
         for intform in int_records:
             interest_income += Decimal(str(intform["interest_income"]))
+            if intform.get("us_savings_bond_interest"):
+                us_treasury_interest += Decimal(str(intform["us_savings_bond_interest"]))
             if intform.get("federal_tax_withheld"):
                 federal_withheld += Decimal(str(intform["federal_tax_withheld"]))
+            if intform.get("state_tax_withheld"):
+                state_withheld += Decimal(str(intform["state_tax_withheld"]))
 
         # --- Reconciliation results (capital gains) ---
         sale_results = repo.get_sale_results(tax_year)
@@ -299,6 +332,9 @@ class TaxEstimator:
             federal_estimated_payments=federal_estimated_payments,
             state_estimated_payments=state_estimated_payments,
             itemized_deductions=itemized_deductions,
+            section_199a_dividends=section_199a_dividends,
+            foreign_tax_paid=foreign_tax_paid,
+            us_treasury_interest=us_treasury_interest,
         )
 
     # ------------------------------------------------------------------

@@ -164,7 +164,16 @@ class ManualAdapter(BaseAdapter):
             total_capital_gain_distributions=Decimal(
                 str(data.get("capital_gain_distributions", "0"))
             ),
+            nondividend_distributions=Decimal(
+                str(data.get("nondividend_distributions", "0"))
+            ),
+            section_199a_dividends=Decimal(
+                str(data.get("section_199a_dividends", "0"))
+            ),
+            foreign_tax_paid=Decimal(str(data.get("foreign_tax_paid", "0"))),
+            foreign_country=data.get("foreign_country"),
             federal_tax_withheld=Decimal(str(data.get("federal_tax_withheld", "0"))),
+            state_tax_withheld=Decimal(str(data.get("state_tax_withheld", "0"))),
         )
         return ImportResult(
             form_type=FormType.FORM_1099DIV,
@@ -178,7 +187,9 @@ class ManualAdapter(BaseAdapter):
             tax_year=int(data.get("tax_year", 0)),
             interest_income=Decimal(str(data["interest_income"])),
             early_withdrawal_penalty=Decimal(str(data.get("early_withdrawal_penalty", "0"))),
+            us_savings_bond_interest=Decimal(str(data.get("us_savings_bond_interest", "0"))),
             federal_tax_withheld=Decimal(str(data.get("federal_tax_withheld", "0"))),
+            state_tax_withheld=Decimal(str(data.get("state_tax_withheld", "0"))),
         )
         return ImportResult(
             form_type=FormType.FORM_1099INT,
@@ -343,6 +354,12 @@ class ManualAdapter(BaseAdapter):
                 continue
             if form.ordinary_dividends < form.qualified_dividends:
                 errors.append("1099-DIV: ordinary_dividends must be >= qualified_dividends")
+            if form.section_199a_dividends > form.ordinary_dividends:
+                errors.append("1099-DIV: section_199a_dividends must be <= ordinary_dividends")
+            if form.nondividend_distributions < 0:
+                errors.append("1099-DIV: nondividend_distributions must be >= 0")
+            if form.foreign_tax_paid < 0:
+                errors.append("1099-DIV: foreign_tax_paid must be >= 0")
         return errors
 
     def _validate_1099int(self, data: ImportResult) -> list[str]:
@@ -352,6 +369,10 @@ class ManualAdapter(BaseAdapter):
                 continue
             if form.interest_income < 0:
                 errors.append("1099-INT: interest_income must be >= 0")
+            if form.us_savings_bond_interest > form.interest_income:
+                errors.append("1099-INT: us_savings_bond_interest must be <= interest_income")
+            if form.us_savings_bond_interest < 0:
+                errors.append("1099-INT: us_savings_bond_interest must be >= 0")
         return errors
 
     def _validate_3921(self, data: ImportResult) -> list[str]:
