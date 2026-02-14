@@ -20,6 +20,29 @@ from app.models.tax_forms import (
 from app.parsing.detector import FormType
 
 
+_TICKER_MAP: dict[str, str] = {
+    "COINBASE": "COIN",
+    "STARBUCKS": "SBUX",
+    "APPLE": "AAPL",
+    "MICROSOFT": "MSFT",
+    "GOOGLE": "GOOGL",
+    "ALPHABET": "GOOGL",
+    "AMAZON": "AMZN",
+    "TESLA": "TSLA",
+    "META": "META",
+    "NVIDIA": "NVDA",
+}
+
+
+def _detect_ticker(name: str) -> str:
+    """Detect stock ticker from a company/security description."""
+    upper = name.upper()
+    for keyword, ticker in _TICKER_MAP.items():
+        if keyword in upper:
+            return ticker
+    return "UNKNOWN"
+
+
 class ManualAdapter(BaseAdapter):
     """Imports JSON files produced by `taxbot parse` into domain models."""
 
@@ -38,6 +61,7 @@ class ManualAdapter(BaseAdapter):
             FormType.FORM_1099INT: self._parse_1099int,
             FormType.FORM_3921: self._parse_3921,
             FormType.FORM_3922: self._parse_3922,
+            FormType.EQUITY_LOTS: self._parse_equity_lots,
         }
         return dispatch[form_type](raw)
 
@@ -50,6 +74,7 @@ class ManualAdapter(BaseAdapter):
             FormType.FORM_1099INT: self._validate_1099int,
             FormType.FORM_3921: self._validate_3921,
             FormType.FORM_3922: self._validate_3922,
+            FormType.EQUITY_LOTS: self._validate_equity_lots,
         }
         return dispatch[data.form_type](data)
 
@@ -66,6 +91,8 @@ class ManualAdapter(BaseAdapter):
 
         if "box1_wages" in sample or "box2_federal_withheld" in sample:
             return FormType.W2
+        if "equity_type" in sample and "cost_per_share" in sample and "acquisition_date" in sample:
+            return FormType.EQUITY_LOTS
         if "exercise_price_per_share" in sample and "fmv_on_exercise_date" in sample:
             return FormType.FORM_3921
         if "purchase_price_per_share" in sample and "fmv_on_purchase_date" in sample:
@@ -135,10 +162,14 @@ class ManualAdapter(BaseAdapter):
             )
             forms.append(form)
 
+            ticker = _detect_ticker(form.description)
             sale = Sale(
                 id=str(uuid4()),
                 lot_id="",  # Not matched yet — happens at reconcile
-                security=Security(ticker="UNKNOWN", name=form.description),
+                security=Security(ticker=ticker, name=form.description),
+                date_acquired=date_acquired if date_acquired else (
+                    str(raw_date_acq) if raw_date_acq and str(raw_date_acq).lower() == "various" else None
+                ),
                 sale_date=form.date_sold,
                 shares=Decimal("0"),  # Often not in 1099-B; inferred at reconcile
                 proceeds_per_share=form.proceeds,  # Store total proceeds; per-share computed later
@@ -224,7 +255,7 @@ class ManualAdapter(BaseAdapter):
                 id=event_id,
                 event_type=TransactionType.EXERCISE,
                 equity_type=EquityType.ISO,
-                security=Security(ticker="UNKNOWN", name=f"ISO Exercise ({corporation})"),
+                security=Security(ticker=_detect_ticker(corporation), name=f"ISO Exercise ({corporation})"),
                 event_date=form.exercise_date,
                 shares=form.shares_transferred,
                 price_per_share=form.fmv_on_exercise_date,
@@ -284,7 +315,7 @@ class ManualAdapter(BaseAdapter):
                 id=event_id,
                 event_type=TransactionType.PURCHASE,
                 equity_type=EquityType.ESPP,
-                security=Security(ticker="UNKNOWN", name=f"ESPP Purchase ({corporation})"),
+                security=Security(ticker=_detect_ticker(corporation), name=f"ESPP Purchase ({corporation})"),
                 event_date=form.purchase_date,
                 shares=form.shares_transferred,
                 price_per_share=form.fmv_on_purchase_date,
@@ -407,6 +438,77 @@ class ManualAdapter(BaseAdapter):
                 )
             if form.shares_transferred <= 0:
                 errors.append("3922: shares_transferred must be > 0")
+        return errors
+
+    # --- Equity lots (manual lot entries) ---
+
+    def _parse_equity_lots(self, data: dict | list) -> ImportResult:
+        records = data if isinstance(data, list) else [data]
+        events: list[EquityEvent] = []
+        lots: list[Lot] = []
+
+        for record in records:
+            equity_type = EquityType(record["equity_type"])
+            ticker = record.get("ticker") or _detect_ticker(record.get("security_name", ""))
+            security = Security(
+                ticker=ticker,
+                name=record.get("security_name", ticker),
+            )
+            acquisition_date = date.fromisoformat(record["acquisition_date"])
+            shares = Decimal(str(record["shares"]))
+            cost_per_share = Decimal(str(record["cost_per_share"]))
+            amt_cost = _decimal_or_none(record.get("amt_cost_per_share"))
+            notes = record.get("notes", "")
+
+            event_type_str = record.get("event_type", "VEST")
+            event_type = TransactionType(event_type_str)
+
+            event_id = str(uuid4())
+            event = EquityEvent(
+                id=event_id,
+                event_type=event_type,
+                equity_type=equity_type,
+                security=security,
+                event_date=acquisition_date,
+                shares=shares,
+                price_per_share=cost_per_share,
+                strike_price=_decimal_or_none(record.get("strike_price")),
+                grant_date=date.fromisoformat(record["grant_date"]) if record.get("grant_date") else None,
+                ordinary_income=shares * cost_per_share if equity_type == EquityType.RSU else Decimal("0"),
+                broker_source=BrokerSource(record.get("broker_source", "MANUAL")),
+            )
+            events.append(event)
+
+            lot = Lot(
+                id=str(uuid4()),
+                equity_type=equity_type,
+                security=security,
+                acquisition_date=acquisition_date,
+                shares=shares,
+                cost_per_share=cost_per_share,
+                amt_cost_per_share=amt_cost,
+                shares_remaining=shares,
+                source_event_id=event_id,
+                broker_source=BrokerSource(record.get("broker_source", "MANUAL")),
+                notes=notes,
+            )
+            lots.append(lot)
+
+        tax_year = int(records[0].get("tax_year", acquisition_date.year))
+        return ImportResult(
+            form_type=FormType.EQUITY_LOTS,
+            tax_year=tax_year,
+            events=events,
+            lots=lots,
+        )
+
+    def _validate_equity_lots(self, data: ImportResult) -> list[str]:
+        errors = []
+        for lot in data.lots:
+            if lot.shares <= 0:
+                errors.append(f"Lot {lot.id}: shares must be > 0")
+            if lot.cost_per_share < 0:
+                errors.append(f"Lot {lot.id}: cost_per_share must be >= 0")
         return errors
 
 

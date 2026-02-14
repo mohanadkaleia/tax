@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from datetime import date
 from decimal import Decimal
 from uuid import uuid4
 
@@ -250,19 +251,28 @@ class TaxRepository:
 
     def save_sale(self, sale: Sale, batch_id: str | None = None) -> None:
         """Insert a sale record."""
+        # Serialize date_acquired: date → ISO string, "Various" → "Various", None → None
+        if isinstance(sale.date_acquired, date):
+            date_acq_str = sale.date_acquired.isoformat()
+        elif isinstance(sale.date_acquired, str):
+            date_acq_str = sale.date_acquired  # "Various"
+        else:
+            date_acq_str = None
+
         self.conn.execute(
             """INSERT OR REPLACE INTO sales
-               (id, lot_id, ticker, security_name, sale_date, shares,
+               (id, lot_id, ticker, security_name, date_acquired, sale_date, shares,
                 proceeds_per_share, broker_reported_basis,
                 broker_reported_basis_per_share,
                 wash_sale_disallowed, form_1099b_received, basis_reported_to_irs,
                 broker_source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 sale.id,
                 sale.lot_id if sale.lot_id else None,
                 sale.security.ticker,
                 sale.security.name,
+                date_acq_str,
                 sale.sale_date.isoformat(),
                 str(sale.shares),
                 str(sale.proceeds_per_share),
@@ -401,16 +411,18 @@ class TaxRepository:
         run_id = run.get("id", str(uuid4()))
         self.conn.execute(
             """INSERT INTO reconciliation_runs
-               (id, tax_year, total_sales, matched_sales, unmatched_sales,
+               (id, tax_year, total_sales, matched_sales, passthrough_sales,
+                unmatched_sales,
                 total_proceeds, total_correct_basis, total_gain_loss,
                 total_ordinary_income, total_amt_adjustment,
                 warnings, errors, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run_id,
                 run["tax_year"],
                 run.get("total_sales", 0),
                 run.get("matched_sales", 0),
+                run.get("passthrough_sales", 0),
                 run.get("unmatched_sales", 0),
                 run.get("total_proceeds"),
                 run.get("total_correct_basis"),

@@ -12,6 +12,8 @@ class FormType(StrEnum):
     FORM_1099INT = "1099int"
     FORM_3921 = "3921"
     FORM_3922 = "3922"
+    SHAREWORKS_SUPPLEMENTAL = "shareworks_supplemental"
+    EQUITY_LOTS = "equity_lots"
 
 
 # Ordered by specificity (most specific first to avoid false matches)

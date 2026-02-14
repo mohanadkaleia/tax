@@ -12,10 +12,10 @@ class TestShareworksAdapter:
         adapter = ShareworksAdapter()
         assert adapter is not None
 
-    def test_parse_not_implemented(self, tmp_path):
+    def test_parse_nonexistent_file(self, tmp_path):
         adapter = ShareworksAdapter()
-        with pytest.raises(NotImplementedError):
-            adapter.parse(tmp_path / "dummy.csv")
+        with pytest.raises(Exception):
+            adapter.parse(tmp_path / "dummy.pdf")
 
 
 class TestRobinhoodAdapter:

@@ -48,8 +48,8 @@ def main(ctx: typer.Context) -> None:
 
 @app.command()
 def import_data(
-    source: str = typer.Argument(..., help="Data source: manual (shareworks, robinhood coming soon)"),
-    file: Path = typer.Argument(..., help="Path to the JSON file produced by `taxbot parse`"),
+    source: str = typer.Argument(..., help="Data source: manual, shareworks (robinhood coming soon)"),
+    file: Path = typer.Argument(..., help="Path to data file (JSON for manual, PDF for shareworks)"),
     year: int | None = typer.Option(
         None,
         "--year",
@@ -67,10 +67,6 @@ def import_data(
     if not file.exists():
         typer.echo(f"Error: File not found: {file}", err=True)
         raise typer.Exit(1)
-    if file.suffix.lower() != ".json":
-        typer.echo(f"Error: File must be JSON: {file}", err=True)
-        raise typer.Exit(1)
-
     # Validate source
     valid_sources = {"manual", "shareworks", "robinhood"}
     if source.lower() not in valid_sources:
@@ -80,17 +76,31 @@ def import_data(
         )
         raise typer.Exit(1)
 
-    if source.lower() != "manual":
-        typer.echo(f"Error: '{source}' adapter not yet implemented. Use 'manual'.", err=True)
+    # Validate file extension based on source
+    if source.lower() == "shareworks":
+        if file.suffix.lower() != ".pdf":
+            typer.echo(f"Error: Shareworks source expects a PDF file: {file}", err=True)
+            raise typer.Exit(1)
+    elif file.suffix.lower() != ".json":
+        typer.echo(f"Error: File must be JSON: {file}", err=True)
+        raise typer.Exit(1)
+
+    if source.lower() == "robinhood":
+        typer.echo(f"Error: '{source}' adapter not yet implemented.", err=True)
         raise typer.Exit(1)
 
     from app.db.repository import TaxRepository
     from app.db.schema import create_schema
-    from app.ingestion.manual import ManualAdapter
     from app.models.tax_forms import W2, Form1099DIV, Form1099INT
 
-    # Parse JSON through ManualAdapter
-    adapter = ManualAdapter()
+    # Select adapter by source
+    if source.lower() == "shareworks":
+        from app.ingestion.shareworks import ShareworksAdapter
+        adapter = ShareworksAdapter()
+    else:
+        from app.ingestion.manual import ManualAdapter
+        adapter = ManualAdapter()
+
     try:
         result = adapter.parse(file)
     except (ValueError, KeyError, FileNotFoundError) as exc:
@@ -234,18 +244,26 @@ def reconcile(
     typer.echo("\nReconciliation complete:")
     typer.echo(f"  Total sales:     {run['total_sales']}")
     typer.echo(f"  Matched:         {run['matched_sales']}")
+    passthrough = run.get('passthrough_sales', 0)
+    if passthrough:
+        typer.echo(f"  Pass-through:    {passthrough}")
     typer.echo(f"  Unmatched:       {run['unmatched_sales']}")
-    typer.echo(f"  Total proceeds:  ${run.get('total_proceeds', '0')}")
-    typer.echo(f"  Correct basis:   ${run.get('total_correct_basis', '0')}")
-    typer.echo(f"  Gain/Loss:       ${run.get('total_gain_loss', '0')}")
+    from decimal import Decimal
+    def _fmt(val: str) -> str:
+        """Format a decimal string to 2 decimal places with commas."""
+        return f"{Decimal(val):,.2f}"
+
+    typer.echo(f"  Total proceeds:  ${_fmt(run.get('total_proceeds', '0'))}")
+    typer.echo(f"  Correct basis:   ${_fmt(run.get('total_correct_basis', '0'))}")
+    typer.echo(f"  Gain/Loss:       ${_fmt(run.get('total_gain_loss', '0'))}")
 
     ordinary = run.get("total_ordinary_income", "0")
     if ordinary and ordinary != "0":
-        typer.echo(f"  Ordinary income: ${ordinary}")
+        typer.echo(f"  Ordinary income: ${_fmt(ordinary)}")
 
     amt = run.get("total_amt_adjustment", "0")
     if amt and amt != "0":
-        typer.echo(f"  AMT adjustment:  ${amt}")
+        typer.echo(f"  AMT adjustment:  ${_fmt(amt)}")
 
     if run.get("warnings"):
         typer.echo("\nWarnings:")
@@ -585,6 +603,112 @@ def report(
     """Generate all tax reports for a tax year."""
     typer.echo(f"Generating reports for year {year} to {output}...")
     typer.echo("Report generation not yet implemented.")
+
+
+@app.command()
+def add_lot(
+    equity_type: str = typer.Argument(..., help="Equity type: RSU, ISO, NSO, ESPP"),
+    ticker: str = typer.Argument(..., help="Stock ticker symbol (e.g. COIN, AAPL)"),
+    acquisition_date: str = typer.Argument(..., help="Date shares were acquired (YYYY-MM-DD)"),
+    shares: int = typer.Argument(..., help="Number of shares"),
+    cost_per_share: float = typer.Argument(..., help="Cost basis per share (e.g. IPO price, strike price)"),
+    name: str = typer.Option(None, "--name", "-n", help="Company/security name"),
+    amt_cost: float | None = typer.Option(None, "--amt-cost", help="AMT cost basis per share (ISOs only)"),
+    event_type: str = typer.Option("VEST", "--event-type", help="Event type: VEST, EXERCISE, PURCHASE"),
+    broker_source: str = typer.Option("MANUAL", "--broker", "-b", help="Broker source: MANUAL, SHAREWORKS, ROBINHOOD"),
+    notes: str = typer.Option("", "--notes", help="Description or notes about this lot"),
+    output: Path = typer.Option(
+        Path("inputs/"),
+        "--output",
+        "-o",
+        help="Output directory for the generated JSON file",
+    ),
+) -> None:
+    """Create a manual equity lot JSON file for import.
+
+    Use this when you have shares not covered by standard tax forms (e.g. pre-IPO
+    RSUs, manual corrections, or lots missing from brokerage statements).
+
+    Examples:
+
+        taxbot add-lot RSU COIN 2020-02-20 181 250 --name "Coinbase" --notes "Pre-IPO RSU"
+
+        taxbot add-lot ISO COIN 2021-04-19 250 18.71 --amt-cost 342.00 --event-type EXERCISE
+    """
+    from datetime import date as date_type
+
+    from app.models.enums import BrokerSource as BS
+    from app.models.enums import EquityType as ET
+    from app.models.enums import TransactionType as TT
+
+    # Validate equity type
+    try:
+        ET(equity_type.upper())
+    except ValueError:
+        valid = ", ".join(e.value for e in ET)
+        typer.echo(f"Error: Invalid equity type '{equity_type}'. Valid: {valid}", err=True)
+        raise typer.Exit(1)
+
+    # Validate event type
+    try:
+        TT(event_type.upper())
+    except ValueError:
+        valid = ", ".join(t.value for t in TT)
+        typer.echo(f"Error: Invalid event type '{event_type}'. Valid: {valid}", err=True)
+        raise typer.Exit(1)
+
+    # Validate broker source
+    try:
+        BS(broker_source.upper())
+    except ValueError:
+        valid = ", ".join(b.value for b in BS)
+        typer.echo(f"Error: Invalid broker source '{broker_source}'. Valid: {valid}", err=True)
+        raise typer.Exit(1)
+
+    # Validate date
+    try:
+        acq_date = date_type.fromisoformat(acquisition_date)
+    except ValueError:
+        typer.echo(f"Error: Invalid date '{acquisition_date}'. Use YYYY-MM-DD format.", err=True)
+        raise typer.Exit(1)
+
+    if shares <= 0:
+        typer.echo("Error: shares must be > 0", err=True)
+        raise typer.Exit(1)
+    if cost_per_share < 0:
+        typer.echo("Error: cost_per_share must be >= 0", err=True)
+        raise typer.Exit(1)
+
+    record = {
+        "tax_year": acq_date.year,
+        "equity_type": equity_type.upper(),
+        "ticker": ticker.upper(),
+        "security_name": name or ticker.upper(),
+        "acquisition_date": acquisition_date,
+        "shares": shares,
+        "cost_per_share": str(Decimal(str(cost_per_share))),
+        "event_type": event_type.upper(),
+        "broker_source": broker_source.upper(),
+        "notes": notes,
+    }
+    if amt_cost is not None:
+        record["amt_cost_per_share"] = str(Decimal(str(amt_cost)))
+
+    # Write to JSON file (append if file exists with same ticker/year)
+    output.mkdir(parents=True, exist_ok=True)
+    base_name = f"equity_lots_{ticker.lower()}_{acq_date.year}"
+    out_path = output / f"{base_name}.json"
+
+    existing: list[dict] = []
+    if out_path.exists():
+        existing = json.loads(out_path.read_text())
+
+    existing.append(record)
+    out_path.write_text(json.dumps(existing, indent=2))
+
+    typer.echo(f"Added {equity_type.upper()} lot: {shares} {ticker.upper()} shares at ${cost_per_share}/share ({acquisition_date})")
+    typer.echo(f"Output: {out_path}")
+    typer.echo(f"Import with: python -m app.cli import-data manual {out_path}")
 
 
 class _DecimalEncoder(json.JSONEncoder):

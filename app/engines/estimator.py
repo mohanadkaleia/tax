@@ -248,7 +248,12 @@ class TaxEstimator:
         short_term_gains = Decimal("0")
         long_term_gains = Decimal("0")
         amt_iso_preference = Decimal("0")
-        total_sale_ordinary_income = Decimal("0")
+        # Track ordinary income by disposition type:
+        # - Disqualifying ESPP: already in W-2 Box 1 (employer reports)
+        # - Qualifying ESPP: NOT in W-2, must be added to income
+        # - ISO disqualifying: already in W-2 Box 1
+        qualifying_espp_oi = Decimal("0")
+        disqualifying_oi = Decimal("0")
 
         if not sale_results:
             recon_runs = repo.get_reconciliation_runs(tax_year)
@@ -267,17 +272,30 @@ class TaxEstimator:
                 long_term_gains += gain
 
             oi = Decimal(str(sr.get("ordinary_income", "0")))
-            total_sale_ordinary_income += oi
+            if oi > 0:
+                notes = sr.get("notes", "") or ""
+                if "QUALIFYING" in notes and "DISQUALIFYING" not in notes:
+                    qualifying_espp_oi += oi
+                else:
+                    disqualifying_oi += oi
 
             amt_adj = Decimal(str(sr.get("amt_adjustment", "0")))
             amt_iso_preference += amt_adj
 
-        if total_sale_ordinary_income > Decimal("0"):
+        # Add qualifying ESPP ordinary income to wages (not in W-2)
+        if qualifying_espp_oi > Decimal("0"):
+            w2_wages += qualifying_espp_oi
             self.warnings.append(
-                f"Equity compensation ordinary income of "
-                f"${total_sale_ordinary_income:,.2f} detected in sale results. "
-                f"Verify this is already included in your W-2 Box 1 wages "
-                f"to avoid double-counting."
+                f"ESPP qualifying disposition ordinary income of "
+                f"${qualifying_espp_oi:,.2f} added to wages "
+                f"(not reported on W-2 — employee must self-report)."
+            )
+
+        if disqualifying_oi > Decimal("0"):
+            self.warnings.append(
+                f"ESPP/ISO disqualifying disposition ordinary income of "
+                f"${disqualifying_oi:,.2f} should already be included in "
+                f"W-2 Box 1 wages — not added again."
             )
 
         # --- Capital loss netting (IRC Section 1211(b)) ---

@@ -1,5 +1,6 @@
 """Lot matching engine: FIFO and specific identification."""
 
+import re
 from decimal import Decimal
 
 from app.models.equity_event import Lot, Sale
@@ -53,6 +54,13 @@ class LotMatcher:
                 return [(lot, sale.shares)]
         return []
 
+    @staticmethod
+    def _clean_words(name: str) -> set[str]:
+        """Extract meaningful words from a security name, stripping punctuation."""
+        # Remove parentheses, commas, etc. and split
+        cleaned = re.sub(r"[^A-Z0-9\s]", " ", name.upper())
+        return {w for w in cleaned.split() if len(w) > 2}
+
     def match_fuzzy(
         self, lots: list[Lot], sale: Sale
     ) -> list[Lot]:
@@ -66,6 +74,7 @@ class LotMatcher:
         """
         sale_name = sale.security.name.upper()
         sale_ticker = sale.security.ticker.upper()
+        sale_words = self._clean_words(sale_name)
         candidates = []
 
         for lot in lots:
@@ -79,6 +88,11 @@ class LotMatcher:
                 candidates.append(lot)
                 continue
 
+            # Check if lot ticker appears in sale name (e.g. "COIN" in description)
+            if lot_ticker != "UNKNOWN" and lot_ticker in sale_words:
+                candidates.append(lot)
+                continue
+
             # Security name substring match
             if sale_name != "UNKNOWN" and sale_name in lot_name:
                 candidates.append(lot)
@@ -87,10 +101,14 @@ class LotMatcher:
                 candidates.append(lot)
                 continue
 
-            # Word overlap (at least 2 meaningful words in common)
-            sale_words = {w for w in sale_name.split() if len(w) > 2}
-            lot_words = {w for w in lot_name.split() if len(w) > 2}
-            if len(sale_words & lot_words) >= 2:
+            # Word overlap (at least 1 meaningful company-name word in common)
+            lot_words = self._clean_words(lot_name)
+            # Filter out generic words that shouldn't drive matching
+            generic = {"INC", "CORP", "LTD", "LLC", "CLASS", "COMMON", "STOCK",
+                        "PURCHASE", "EXERCISE", "ESPP", "RSU", "ISO", "NSO"}
+            sale_significant = sale_words - generic
+            lot_significant = lot_words - generic
+            if sale_significant and lot_significant and (sale_significant & lot_significant):
                 candidates.append(lot)
 
         return candidates

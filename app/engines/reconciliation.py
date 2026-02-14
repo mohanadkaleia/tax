@@ -16,8 +16,8 @@ from app.engines.espp import ESPPEngine
 from app.engines.iso_amt import ISOAMTEngine
 from app.engines.lot_matcher import LotMatcher
 from app.exceptions import MissingEventDataError
-from app.models.enums import BrokerSource, EquityType
-from app.models.equity_event import Lot, Sale, SaleResult, Security
+from app.models.enums import AdjustmentCode, BrokerSource, EquityType, HoldingPeriod, TransactionType
+from app.models.equity_event import EquityEvent, Lot, Sale, SaleResult, Security
 from app.models.reports import AuditEntry
 from app.models.tax_forms import Form3921, Form3922
 
@@ -68,18 +68,25 @@ class ReconciliationEngine:
         # 3-5. Process each sale
         results: list[SaleResult] = []
         matched = 0
+        passthrough = 0
         unmatched = 0
 
         for sale in sales:
             sale_results = self._process_sale(sale, lots, events)
             if sale_results:
+                # Distinguish pass-through (lot_id=None) from real matches
+                if any(r.lot_id is None for r in sale_results):
+                    passthrough += 1
+                else:
+                    matched += 1
                 results.extend(sale_results)
-                matched += 1
             else:
                 unmatched += 1
 
         # 6. Build and save summary
-        run = self._build_run_summary(tax_year, results, matched, unmatched)
+        run = self._build_run_summary(
+            tax_year, results, matched, unmatched, passthrough
+        )
         self.repo.save_reconciliation_run(run)
 
         # Audit log
@@ -91,6 +98,7 @@ class ReconciliationEngine:
             output={
                 "total_sales": len(sales),
                 "matched": matched,
+                "passthrough": passthrough,
                 "unmatched": unmatched,
                 "total_gain_loss": run.get("total_gain_loss"),
             },
@@ -114,11 +122,16 @@ class ReconciliationEngine:
             matching_lots = self.lot_matcher.match_fuzzy(lots, sale)
 
         if not matching_lots:
-            self.warnings.append(
-                f"No lots found for sale {sale.id} "
-                f"({sale.security.ticker} on {sale.sale_date})"
-            )
-            return []
+            # No lots found — try auto-creating a lot from 1099-B data.
+            # This handles RSU sales where no lot was imported (e.g. pre-IPO vests,
+            # or dates outside the Shareworks PDF range).
+            auto_lot = self._auto_create_lot(sale)
+            if auto_lot:
+                lots.append(auto_lot)
+                matching_lots = [auto_lot]
+            else:
+                # Fall back to pass-through for "Various" dates, missing basis, etc.
+                return self._passthrough_sale(sale)
 
         # Determine shares to allocate
         sale_for_match = sale
@@ -127,11 +140,19 @@ class ReconciliationEngine:
             # Try to infer shares from available lots
             sale_for_match = self._infer_sale_shares(sale, matching_lots)
             if sale_for_match.shares == 0:
-                self.warnings.append(
-                    f"Cannot infer share count for sale {sale.id} — "
-                    "set shares manually or import lot data first"
-                )
-                return []
+                # Could not infer shares from existing lots (no lot matches
+                # the sale's date_acquired). Try auto-creating a lot from
+                # 1099-B data — this handles pre-IPO vests, dates outside
+                # the Shareworks PDF range, etc.
+                auto_lot = self._auto_create_lot(sale)
+                if auto_lot:
+                    lots.append(auto_lot)
+                    matching_lots = [auto_lot]
+                    sale_for_match = self._infer_sale_shares(sale, [auto_lot])
+                    if sale_for_match.shares == 0:
+                        return self._passthrough_sale(sale)
+                else:
+                    return self._passthrough_sale(sale)
 
         # Match sale to lots
         if sale_for_match.lot_id:
@@ -139,8 +160,18 @@ class ReconciliationEngine:
                 matching_lots, sale_for_match, method="SPECIFIC"
             )
         else:
+            # If sale has a specific date_acquired, prefer lots from that date
+            fifo_lots = matching_lots
+            if isinstance(sale_for_match.date_acquired, date):
+                date_lots = [
+                    lot for lot in matching_lots
+                    if lot.acquisition_date == sale_for_match.date_acquired
+                    and lot.shares_remaining > 0
+                ]
+                if date_lots:
+                    fifo_lots = date_lots
             allocations = self.lot_matcher.match(
-                matching_lots, sale_for_match, method="FIFO"
+                fifo_lots, sale_for_match, method="FIFO"
             )
 
         if not allocations:
@@ -150,6 +181,9 @@ class ReconciliationEngine:
             return []
 
         # Process each allocation
+        # Use sale_for_match which has corrected per-share proceeds when
+        # shares were inferred from 1099-B total proceeds
+        effective_sale = sale_for_match if sale_for_match is not sale else sale
         results: list[SaleResult] = []
         total_allocated = sum(shares for _, shares in allocations)
 
@@ -159,23 +193,23 @@ class ReconciliationEngine:
                 # Split broker-reported basis proportionally
                 ratio = shares_allocated / total_allocated
                 sub_broker_basis = (
-                    (sale.broker_reported_basis * ratio)
-                    if sale.broker_reported_basis
+                    (effective_sale.broker_reported_basis * ratio)
+                    if effective_sale.broker_reported_basis
                     else None
                 )
             else:
-                sub_broker_basis = sale.broker_reported_basis
+                sub_broker_basis = effective_sale.broker_reported_basis
 
             sub_sale = Sale(
-                id=sale.id,
+                id=effective_sale.id,
                 lot_id=lot.id,
-                security=sale.security,
-                sale_date=sale.sale_date,
+                security=effective_sale.security,
+                sale_date=effective_sale.sale_date,
                 shares=shares_allocated,
-                proceeds_per_share=sale.proceeds_per_share,
+                proceeds_per_share=effective_sale.proceeds_per_share,
                 broker_reported_basis=sub_broker_basis,
-                basis_reported_to_irs=sale.basis_reported_to_irs,
-                broker_source=sale.broker_source,
+                basis_reported_to_irs=effective_sale.basis_reported_to_irs,
+                broker_source=effective_sale.broker_source,
             )
 
             try:
@@ -219,26 +253,251 @@ class ReconciliationEngine:
             case _:
                 raise ValueError(f"Unknown equity type: {lot.equity_type}")
 
+    def _passthrough_sale(self, sale: Sale) -> list[SaleResult]:
+        """Create a SaleResult directly from 1099-B data without lot matching.
+
+        Used when no acquisition lots are found but the 1099-B provides both
+        proceeds and broker-reported basis. Acceptable for RSU sales where the
+        broker already reported the correct cost basis to the IRS.
+
+        ESPP and ISO sales are blocked — they require lot data for correct
+        ordinary income and AMT computation.
+        """
+        # Fix 1 (CRITICAL): Block ESPP/ISO from pass-through
+        sale_desc = (sale.security.name or "").upper()
+        if any(kw in sale_desc for kw in ("ESPP", "EMPLOYEE STOCK PURCHASE")):
+            self.errors.append(
+                f"Sale {sale.id} ({sale.security.name} on {sale.sale_date}): "
+                f"Appears to be ESPP — cannot use pass-through. "
+                f"Import Form 3922 data first to create ESPP lots."
+            )
+            return []
+        if any(kw in sale_desc for kw in ("ISO", "INCENTIVE STOCK OPTION")):
+            self.errors.append(
+                f"Sale {sale.id} ({sale.security.name} on {sale.sale_date}): "
+                f"Appears to be ISO — cannot use pass-through. "
+                f"Import Form 3921 data first to create ISO lots."
+            )
+            return []
+
+        # Must have broker-reported basis to pass through
+        if sale.broker_reported_basis is None:
+            self.warnings.append(
+                f"No lots found and no broker basis for sale {sale.id} "
+                f"({sale.security.name} on {sale.sale_date})"
+            )
+            return []
+
+        # proceeds_per_share actually stores total proceeds for 1099-B imports
+        proceeds = sale.proceeds_per_share if sale.shares == 0 else sale.total_proceeds
+        broker_basis = sale.broker_reported_basis
+        gain_loss = proceeds - broker_basis
+
+        # Fix 5: Use self.basis_engine instead of throwaway instances
+        # Determine holding period from date_acquired
+        if isinstance(sale.date_acquired, date):
+            holding = self.basis_engine._holding_period(
+                sale.date_acquired, sale.sale_date
+            )
+        else:
+            # "Various" or None — default to short-term (conservative)
+            holding = HoldingPeriod.SHORT_TERM
+            if sale.date_acquired and str(sale.date_acquired).lower() == "various":
+                self.warnings.append(
+                    f"Sale {sale.id}: date_acquired is 'Various', "
+                    f"defaulting to short-term. Review manually."
+                )
+
+        category = self.basis_engine._form_8949_category(
+            holding, sale.basis_reported_to_irs, sale.form_1099b_received
+        )
+
+        # Fix 6: Determine adjustment code and amount consistently
+        adj_amount = Decimal("0")
+        if sale.wash_sale_disallowed > 0:
+            adj_amount = sale.wash_sale_disallowed
+            adj_code = AdjustmentCode.W
+        elif not sale.basis_reported_to_irs:
+            adj_code = AdjustmentCode.B
+            self.warnings.append(
+                f"Sale {sale.id}: basis not reported to IRS and no lot data "
+                f"available for correction. Using broker basis ${broker_basis:,.2f}. "
+                f"Verify this is correct."
+            )
+        else:
+            adj_code = AdjustmentCode.NONE
+
+        # Fix 4: Use sentinel date instead of sale_date for unknown acquisition
+        if isinstance(sale.date_acquired, date):
+            acq_date = sale.date_acquired
+            acq_note = ""
+        else:
+            acq_date = date(1, 1, 1)  # Sentinel: unknown acquisition date
+            acq_note = " (acquisition date unknown)"
+
+        result = SaleResult(
+            sale_id=sale.id,
+            lot_id=None,  # No lot matched — pass-through
+            security=sale.security,
+            acquisition_date=acq_date,
+            sale_date=sale.sale_date,
+            shares=sale.shares,  # Fix 2: Keep actual shares (0 = unknown)
+            proceeds=proceeds,
+            broker_reported_basis=broker_basis,
+            correct_basis=broker_basis,  # Accept broker basis for pass-through
+            adjustment_amount=adj_amount,
+            adjustment_code=adj_code,
+            holding_period=holding,
+            form_8949_category=category,
+            gain_loss=gain_loss,
+            wash_sale_disallowed=sale.wash_sale_disallowed,
+            notes=f"Pass-through: basis from 1099-B (no lot matching){acq_note}",
+        )
+
+        try:
+            self.repo.save_sale_result(result)
+        except Exception as exc:
+            self.errors.append(f"Failed to save pass-through result for sale {sale.id}: {exc}")
+            return []
+
+        return [result]
+
+    def _auto_create_lot(self, sale: Sale) -> Lot | None:
+        """Auto-create an RSU lot from 1099-B sale data when no lot exists.
+
+        When the 1099-B provides date_acquired and broker_reported_basis but
+        no acquisition lot exists in the database (e.g. pre-IPO RSU vests,
+        or dates outside the Shareworks PDF range), create a synthetic lot
+        so the sale flows through proper basis correction.
+
+        Returns the created Lot, or None if preconditions aren't met.
+        """
+        # Must have a valid date_acquired and broker_reported_basis
+        if not isinstance(sale.date_acquired, date):
+            return None
+        if sale.broker_reported_basis is None:
+            return None
+
+        # Block ESPP/ISO — they need proper event data (Form 3922/3921)
+        sale_desc = (sale.security.name or "").upper()
+        if any(kw in sale_desc for kw in ("ESPP", "EMPLOYEE STOCK PURCHASE")):
+            return None
+        if any(kw in sale_desc for kw in ("ISO", "INCENTIVE STOCK OPTION")):
+            return None
+
+        # Determine shares and cost_per_share
+        if sale.shares > 0:
+            shares = sale.shares
+            cost_per_share = sale.broker_reported_basis / shares
+        else:
+            # 1099-B with unknown shares: treat entire basis as 1 unit
+            shares = Decimal("1")
+            cost_per_share = sale.broker_reported_basis
+
+        event_id = str(uuid4())
+        event = EquityEvent(
+            id=event_id,
+            event_type=TransactionType.VEST,
+            equity_type=EquityType.RSU,
+            security=sale.security,
+            event_date=sale.date_acquired,
+            shares=shares,
+            price_per_share=cost_per_share,
+            broker_source=sale.broker_source,
+        )
+
+        lot = Lot(
+            id=str(uuid4()),
+            equity_type=EquityType.RSU,
+            security=sale.security,
+            acquisition_date=sale.date_acquired,
+            shares=shares,
+            cost_per_share=cost_per_share,
+            shares_remaining=shares,
+            source_event_id=event_id,
+            broker_source=sale.broker_source,
+            notes=f"Auto-created from 1099-B data (sale {sale.id})",
+        )
+
+        # Persist to database
+        self.repo.save_event(event)
+        self.repo.save_lot(lot)
+
+        self.warnings.append(
+            f"Auto-created RSU lot for {sale.security.ticker} "
+            f"(acquired {sale.date_acquired.isoformat()}, "
+            f"basis ${sale.broker_reported_basis:,.2f}) from 1099-B data."
+        )
+
+        return lot
+
     def _infer_sale_shares(self, sale: Sale, lots: list[Lot]) -> Sale:
         """Try to infer share count for a 1099-B sale with shares=0.
 
-        If total proceeds and lot cost_per_share are known, we can infer shares.
-        Otherwise, if there's exactly one lot with remaining shares, use those.
+        Strategy (in priority order):
+        1. Filter lots by date_acquired matching lot.acquisition_date,
+           then compute shares = broker_reported_basis / cost_per_share.
+        2. If only one lot candidate total, use its remaining shares.
+        3. Otherwise, return original (shares=0 → caller logs warning).
         """
-        # If only one lot candidate and it has shares, use its remaining shares
         available_lots = [lot for lot in lots if lot.shares_remaining > 0]
+
+        # For 1099-B imports, proceeds_per_share holds total proceeds.
+        # We need to convert to actual per-share when inferring shares.
+        total_proceeds = sale.proceeds_per_share  # This is total, not per-share
+
+        # Strategy 1: Match by acquisition date and infer from cost basis
+        if isinstance(sale.date_acquired, date) and sale.broker_reported_basis:
+            date_lots = [
+                lot for lot in available_lots
+                if lot.acquisition_date == sale.date_acquired
+            ]
+            if date_lots and date_lots[0].cost_per_share > 0:
+                cost_per_share = date_lots[0].cost_per_share
+                inferred = int(round(sale.broker_reported_basis / cost_per_share))
+                if inferred > 0:
+                    per_share = total_proceeds / Decimal(str(inferred))
+                    return Sale(
+                        id=sale.id,
+                        lot_id=sale.lot_id,
+                        security=sale.security,
+                        date_acquired=sale.date_acquired,
+                        sale_date=sale.sale_date,
+                        shares=Decimal(str(inferred)),
+                        proceeds_per_share=per_share,
+                        broker_reported_basis=sale.broker_reported_basis,
+                        basis_reported_to_irs=sale.basis_reported_to_irs,
+                        broker_source=sale.broker_source,
+                    )
+
+        # Strategy 2: Single lot candidate — use its remaining shares.
+        # Only when dates are compatible (lot date matches sale date, or sale
+        # has no specific date). Prevents matching a 2020 sale to a 2021 lot.
         if len(available_lots) == 1:
-            return Sale(
-                id=sale.id,
-                lot_id=sale.lot_id,
-                security=sale.security,
-                sale_date=sale.sale_date,
-                shares=available_lots[0].shares_remaining,
-                proceeds_per_share=sale.proceeds_per_share,
-                broker_reported_basis=sale.broker_reported_basis,
-                basis_reported_to_irs=sale.basis_reported_to_irs,
-                broker_source=sale.broker_source,
+            candidate = available_lots[0]
+            date_compatible = (
+                not isinstance(sale.date_acquired, date)
+                or candidate.acquisition_date == sale.date_acquired
             )
+            if date_compatible:
+                inferred_shares = candidate.shares_remaining
+                per_share = (
+                    total_proceeds / inferred_shares
+                    if inferred_shares > 0
+                    else total_proceeds
+                )
+                return Sale(
+                    id=sale.id,
+                    lot_id=sale.lot_id,
+                    security=sale.security,
+                    date_acquired=sale.date_acquired,
+                    sale_date=sale.sale_date,
+                    shares=inferred_shares,
+                    proceeds_per_share=per_share,
+                    broker_reported_basis=sale.broker_reported_basis,
+                    basis_reported_to_irs=sale.basis_reported_to_irs,
+                    broker_source=sale.broker_source,
+                )
 
         # Can't infer — return original
         return sale
@@ -250,6 +509,18 @@ class ReconciliationEngine:
         rows = self.repo.get_sales(tax_year)
         sales = []
         for row in rows:
+            # Parse date_acquired: ISO date string, "Various", or None
+            raw_date_acq = row.get("date_acquired")
+            if raw_date_acq and raw_date_acq.lower() != "various":
+                try:
+                    parsed_date_acq: date | str | None = date.fromisoformat(raw_date_acq)
+                except ValueError:
+                    parsed_date_acq = raw_date_acq
+            elif raw_date_acq:
+                parsed_date_acq = raw_date_acq  # "Various"
+            else:
+                parsed_date_acq = None
+
             sales.append(Sale(
                 id=row["id"],
                 lot_id=row.get("lot_id") or "",
@@ -257,6 +528,7 @@ class ReconciliationEngine:
                     ticker=row["ticker"],
                     name=row.get("security_name") or row["ticker"],
                 ),
+                date_acquired=parsed_date_acq,
                 sale_date=date.fromisoformat(row["sale_date"]),
                 shares=Decimal(row["shares"]),
                 proceeds_per_share=Decimal(row["proceeds_per_share"]),
@@ -347,6 +619,7 @@ class ReconciliationEngine:
         results: list[SaleResult],
         matched: int,
         unmatched: int,
+        passthrough: int = 0,
     ) -> dict:
         """Build reconciliation run summary from results."""
         total_proceeds = sum(r.proceeds for r in results) if results else Decimal("0")
@@ -358,8 +631,9 @@ class ReconciliationEngine:
         return {
             "id": str(uuid4()),
             "tax_year": tax_year,
-            "total_sales": matched + unmatched,
+            "total_sales": matched + passthrough + unmatched,
             "matched_sales": matched,
+            "passthrough_sales": passthrough,
             "unmatched_sales": unmatched,
             "total_proceeds": str(total_proceeds),
             "total_correct_basis": str(total_basis),

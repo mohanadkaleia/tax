@@ -42,6 +42,7 @@ class Form8949Category(StrEnum):
 class AdjustmentCode(StrEnum):
     B = "B"
     E = "e"
+    W = "W"
     OTHER = "O"  # noqa: E741
     NONE = ""
 

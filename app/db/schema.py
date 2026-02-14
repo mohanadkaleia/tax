@@ -3,7 +3,7 @@
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS sales (
     lot_id TEXT REFERENCES lots(id),
     ticker TEXT NOT NULL,
     security_name TEXT,
+    date_acquired TEXT,
     sale_date TEXT NOT NULL,
     shares TEXT NOT NULL,
     proceeds_per_share TEXT NOT NULL,
@@ -156,6 +157,7 @@ CREATE TABLE IF NOT EXISTS reconciliation_runs (
     run_at TEXT NOT NULL DEFAULT (datetime('now')),
     total_sales INTEGER NOT NULL DEFAULT 0,
     matched_sales INTEGER NOT NULL DEFAULT 0,
+    passthrough_sales INTEGER NOT NULL DEFAULT 0,
     unmatched_sales INTEGER NOT NULL DEFAULT 0,
     total_proceeds TEXT,
     total_correct_basis TEXT,

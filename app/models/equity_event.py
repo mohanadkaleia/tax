@@ -67,6 +67,7 @@ class Sale(BaseModel):
     id: str
     lot_id: str
     security: Security
+    date_acquired: date | str | None = None  # "Various" allowed; None if unknown
     sale_date: date
     shares: Decimal = Field(ge=0)
     proceeds_per_share: Decimal
@@ -86,7 +87,7 @@ class SaleResult(BaseModel):
     """Output of basis correction engine for a single sale."""
 
     sale_id: str
-    lot_id: str
+    lot_id: str | None = None
     security: Security
     acquisition_date: date
     sale_date: date

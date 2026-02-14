@@ -255,7 +255,11 @@ class TestVisionExtractorUnit:
 
 class TestVisionPrompts:
     def test_all_form_types_have_prompts(self):
+        # EQUITY_LOTS and SHAREWORKS_SUPPLEMENTAL are manual/adapter-only, no vision prompt needed
+        skip = {FormType.EQUITY_LOTS, FormType.SHAREWORKS_SUPPLEMENTAL}
         for ft in FormType:
+            if ft in skip:
+                continue
             assert ft in FORM_PROMPTS, f"Missing vision prompt for {ft.value}"
 
     def test_system_prompt_mentions_json(self):

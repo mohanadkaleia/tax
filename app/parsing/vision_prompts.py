@@ -226,4 +226,5 @@ FORM_PROMPTS: dict[FormType, str] = {
     FormType.FORM_1099INT: FORM_1099INT_PROMPT,
     FormType.FORM_3921: FORM_3921_PROMPT,
     FormType.FORM_3922: FORM_3922_PROMPT,
+    FormType.SHAREWORKS_SUPPLEMENTAL: "",  # Not a standard form; parsed by ShareworksAdapter
 }

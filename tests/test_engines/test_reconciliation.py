@@ -349,6 +349,370 @@ class TestReconcileEdgeCases:
         assert runs[0]["matched_sales"] == 1
 
 
+class TestAutoLotCreation:
+    """Tests for auto-lot creation from 1099-B data when no lots exist."""
+
+    def test_auto_lot_matched(self, repo, engine):
+        """Sale with date_acquired + broker_basis and no lots → auto-lot matched."""
+        sale = Sale(
+            id="sale-pt-001",
+            lot_id="",
+            security=Security(ticker="UNKNOWN", name="COINBASE GLOBAL INC CL A"),
+            date_acquired=date(2024, 5, 14),
+            sale_date=date(2024, 11, 11),
+            shares=Decimal("0"),
+            proceeds_per_share=Decimal("51037.21"),  # Total proceeds
+            broker_reported_basis=Decimal("8057.40"),
+            basis_reported_to_irs=True,
+            broker_source=BrokerSource.MANUAL,
+        )
+        repo.save_sale(sale)
+
+        run = engine.reconcile(2024)
+
+        assert run["matched_sales"] == 1
+        assert run["passthrough_sales"] == 0
+        assert run["unmatched_sales"] == 0
+        assert Decimal(run["total_proceeds"]) == Decimal("51037.21")
+        assert Decimal(run["total_correct_basis"]) == Decimal("8057.40")
+        assert Decimal(run["total_gain_loss"]) == Decimal("42979.81")
+
+        results = repo.get_sale_results(2024)
+        assert len(results) == 1
+        assert results[0]["lot_id"] is not None  # Matched to auto-created lot
+        assert results[0]["adjustment_code"] == ""  # No adjustment (basis matches)
+        assert results[0]["holding_period"] == "SHORT_TERM"  # May 14 → Nov 11 < 1 year
+        assert any("Auto-created" in w for w in run["warnings"])
+
+    def test_auto_lot_creates_db_records(self, repo, engine):
+        """Auto-lot creation persists both lot and event to database."""
+        sale = Sale(
+            id="sale-autolot-db",
+            lot_id="",
+            security=Security(ticker="COIN", name="Coinbase"),
+            date_acquired=date(2020, 2, 20),
+            sale_date=date(2024, 11, 27),
+            shares=Decimal("0"),
+            proceeds_per_share=Decimal("4649.87"),
+            broker_reported_basis=Decimal("3365.85"),
+            basis_reported_to_irs=False,
+            broker_source=BrokerSource.MANUAL,
+        )
+        repo.save_sale(sale)
+
+        engine.reconcile(2024)
+
+        # Verify lot created
+        lots = repo.get_lots("COIN")
+        assert len(lots) == 1
+        assert lots[0]["equity_type"] == "RSU"
+        assert lots[0]["acquisition_date"] == "2020-02-20"
+        assert Decimal(lots[0]["cost_per_share"]) == Decimal("3365.85")
+        assert "Auto-created" in (lots[0]["notes"] or "")
+
+        # Verify event created
+        events = repo.get_events(ticker="COIN")
+        assert len(events) == 1
+        assert events[0]["event_type"] == "VEST"
+        assert events[0]["equity_type"] == "RSU"
+
+    def test_auto_lot_holding_period_short(self, repo, engine):
+        """Short-term holding period computed from auto-lot acquisition date."""
+        sale = Sale(
+            id="sale-pt-st",
+            lot_id="",
+            security=Security(ticker="UNKNOWN", name="Test Stock"),
+            date_acquired=date(2024, 5, 14),
+            sale_date=date(2024, 11, 11),
+            shares=Decimal("0"),
+            proceeds_per_share=Decimal("10000"),
+            broker_reported_basis=Decimal("8000"),
+            basis_reported_to_irs=True,
+            broker_source=BrokerSource.MANUAL,
+        )
+        repo.save_sale(sale)
+
+        run = engine.reconcile(2024)
+        results = repo.get_sale_results(2024)
+        assert results[0]["holding_period"] == "SHORT_TERM"
+        assert results[0]["form_8949_category"] == "A"  # ST + basis reported
+
+    def test_auto_lot_holding_period_long(self, repo, engine):
+        """Long-term holding period computed from auto-lot acquisition date."""
+        sale = Sale(
+            id="sale-pt-lt",
+            lot_id="",
+            security=Security(ticker="UNKNOWN", name="Test Stock"),
+            date_acquired=date(2023, 1, 1),
+            sale_date=date(2024, 6, 1),
+            shares=Decimal("0"),
+            proceeds_per_share=Decimal("10000"),
+            broker_reported_basis=Decimal("8000"),
+            basis_reported_to_irs=True,
+            broker_source=BrokerSource.MANUAL,
+        )
+        repo.save_sale(sale)
+
+        run = engine.reconcile(2024)
+        results = repo.get_sale_results(2024)
+        assert results[0]["holding_period"] == "LONG_TERM"
+        assert results[0]["form_8949_category"] == "D"  # LT + basis reported
+
+    def test_auto_lot_basis_not_reported(self, repo, engine):
+        """Sale with basis not reported → auto-lot matched, category B."""
+        sale = Sale(
+            id="sale-pt-notrep",
+            lot_id="",
+            security=Security(ticker="UNKNOWN", name="Some Stock"),
+            date_acquired=date(2024, 5, 20),
+            sale_date=date(2024, 5, 20),
+            shares=Decimal("0"),
+            proceeds_per_share=Decimal("22108.18"),
+            broker_reported_basis=Decimal("21590.40"),
+            basis_reported_to_irs=False,
+            broker_source=BrokerSource.MANUAL,
+        )
+        repo.save_sale(sale)
+
+        run = engine.reconcile(2024)
+
+        assert run["matched_sales"] == 1
+        assert run["passthrough_sales"] == 0
+        results = repo.get_sale_results(2024)
+        # Auto-lot basis = broker basis → no adjustment needed
+        assert results[0]["adjustment_code"] == ""
+        assert results[0]["form_8949_category"] == "B"  # ST + basis NOT reported
+        assert any("Auto-created" in w for w in run["warnings"])
+
+    def test_auto_lot_with_known_shares(self, repo, engine):
+        """Auto-lot creation when sale has known share count."""
+        sale = Sale(
+            id="sale-autolot-shares",
+            lot_id="",
+            security=Security(ticker="COIN", name="Coinbase"),
+            date_acquired=date(2024, 5, 14),
+            sale_date=date(2024, 11, 11),
+            shares=Decimal("50"),
+            proceeds_per_share=Decimal("175.00"),
+            broker_reported_basis=Decimal("7500.00"),
+            basis_reported_to_irs=True,
+            broker_source=BrokerSource.MANUAL,
+        )
+        repo.save_sale(sale)
+
+        run = engine.reconcile(2024)
+
+        assert run["matched_sales"] == 1
+        lots = repo.get_lots("COIN")
+        assert len(lots) == 1
+        assert Decimal(lots[0]["shares"]) == Decimal("50")
+        assert Decimal(lots[0]["cost_per_share"]) == Decimal("150.00")  # 7500/50
+
+    def test_no_auto_lot_without_date(self, repo, engine):
+        """Sale without date_acquired → no auto-lot, falls to pass-through."""
+        sale = Sale(
+            id="sale-nodate",
+            lot_id="",
+            security=Security(ticker="UNKNOWN", name="Test Stock"),
+            sale_date=date(2024, 6, 1),
+            shares=Decimal("0"),
+            proceeds_per_share=Decimal("10000"),
+            broker_reported_basis=Decimal("8000"),
+            basis_reported_to_irs=True,
+            broker_source=BrokerSource.MANUAL,
+        )
+        repo.save_sale(sale)
+
+        run = engine.reconcile(2024)
+        assert run["passthrough_sales"] == 1
+        assert run["matched_sales"] == 0
+
+    def test_no_auto_lot_without_basis(self, repo, engine):
+        """Sale without broker_reported_basis → no auto-lot."""
+        sale = Sale(
+            id="sale-nobasis",
+            lot_id="",
+            security=Security(ticker="UNKNOWN", name="Test Stock"),
+            date_acquired=date(2024, 5, 14),
+            sale_date=date(2024, 11, 11),
+            shares=Decimal("100"),
+            proceeds_per_share=Decimal("50"),
+            broker_reported_basis=None,
+            basis_reported_to_irs=False,
+            broker_source=BrokerSource.MANUAL,
+        )
+        repo.save_sale(sale)
+
+        run = engine.reconcile(2024)
+        assert run["unmatched_sales"] == 1
+        assert run["matched_sales"] == 0
+
+    def test_auto_lot_when_lots_exist_by_ticker_but_not_date(self, repo, engine):
+        """Sale matches lots by ticker but no lot has the same date → auto-lot.
+
+        This covers pre-IPO RSU vests: the 1099-B shows date_acquired=2020-02-20
+        but the Shareworks PDF only has lots starting from 2021+.
+        """
+        security = Security(ticker="COIN", name="Coinbase")
+
+        # Create a lot for a DIFFERENT date (simulating Shareworks import)
+        event = EquityEvent(
+            id="evt-later",
+            event_type=TransactionType.VEST,
+            equity_type=EquityType.RSU,
+            security=security,
+            event_date=date(2021, 5, 17),
+            shares=Decimal("50"),
+            price_per_share=Decimal("200.00"),
+            broker_source=BrokerSource.MANUAL,
+        )
+        repo.save_event(event)
+        lot = Lot(
+            id="lot-later",
+            equity_type=EquityType.RSU,
+            security=security,
+            acquisition_date=date(2021, 5, 17),
+            shares=Decimal("50"),
+            cost_per_share=Decimal("200.00"),
+            shares_remaining=Decimal("50"),
+            source_event_id="evt-later",
+            broker_source=BrokerSource.MANUAL,
+        )
+        repo.save_lot(lot)
+
+        # Sale from an earlier date (pre-IPO) — no lot for 2020-02-20
+        sale = Sale(
+            id="sale-preipo",
+            lot_id="",
+            security=Security(ticker="COIN", name="COINBASE GLOBAL INC CL A"),
+            date_acquired=date(2020, 2, 20),
+            sale_date=date(2024, 11, 27),
+            shares=Decimal("0"),
+            proceeds_per_share=Decimal("4649.87"),
+            broker_reported_basis=Decimal("3365.85"),
+            basis_reported_to_irs=False,
+            broker_source=BrokerSource.MANUAL,
+        )
+        repo.save_sale(sale)
+
+        run = engine.reconcile(2024)
+
+        assert run["matched_sales"] == 1
+        assert run["passthrough_sales"] == 0
+        assert Decimal(run["total_proceeds"]) == Decimal("4649.87")
+        assert Decimal(run["total_correct_basis"]) == Decimal("3365.85")
+        assert any("Auto-created" in w for w in run["warnings"])
+
+        # Verify auto-lot created with correct date
+        lots = repo.get_lots("COIN")
+        auto_lots = [l for l in lots if l["acquisition_date"] == "2020-02-20"]
+        assert len(auto_lots) == 1
+        assert auto_lots[0]["equity_type"] == "RSU"
+
+        # Original lot should be untouched
+        original = [l for l in lots if l["acquisition_date"] == "2021-05-17"]
+        assert len(original) == 1
+        assert Decimal(original[0]["shares_remaining"]) == Decimal("50")
+
+
+class TestPassthroughReconciliation:
+    """Tests for pass-through reconciliation (Various dates, etc.)."""
+
+    def test_passthrough_blocked_for_espp(self, repo, engine):
+        """ESPP sale without lots should be blocked from pass-through."""
+        sale = Sale(
+            id="sale-pt-espp-blocked",
+            lot_id="",
+            security=Security(ticker="UNKNOWN", name="ESPP Stock"),
+            date_acquired=date(2024, 5, 20),
+            sale_date=date(2024, 5, 20),
+            shares=Decimal("0"),
+            proceeds_per_share=Decimal("22108.18"),
+            broker_reported_basis=Decimal("21590.40"),
+            basis_reported_to_irs=False,
+            broker_source=BrokerSource.MANUAL,
+        )
+        repo.save_sale(sale)
+
+        run = engine.reconcile(2024)
+
+        assert run["unmatched_sales"] == 1
+        assert run["passthrough_sales"] == 0
+        assert any("ESPP" in e for e in run["errors"])
+
+    def test_passthrough_blocked_for_iso(self, repo, engine):
+        """ISO sale without lots should be blocked from pass-through."""
+        sale = Sale(
+            id="sale-pt-iso-blocked",
+            lot_id="",
+            security=Security(ticker="UNKNOWN", name="ISO Exercise Stock"),
+            date_acquired=date(2024, 5, 20),
+            sale_date=date(2024, 5, 20),
+            shares=Decimal("0"),
+            proceeds_per_share=Decimal("10000"),
+            broker_reported_basis=Decimal("5000"),
+            basis_reported_to_irs=False,
+            broker_source=BrokerSource.MANUAL,
+        )
+        repo.save_sale(sale)
+
+        run = engine.reconcile(2024)
+
+        assert run["unmatched_sales"] == 1
+        assert any("ISO" in e for e in run["errors"])
+
+    def test_passthrough_various_date_acquired(self, repo, engine):
+        """Sale with 'Various' date_acquired defaults to short-term."""
+        sale = Sale(
+            id="sale-pt-various",
+            lot_id="",
+            security=Security(ticker="UNKNOWN", name="Test Stock"),
+            date_acquired="Various",
+            sale_date=date(2024, 6, 1),
+            shares=Decimal("0"),
+            proceeds_per_share=Decimal("10000"),
+            broker_reported_basis=Decimal("8000"),
+            basis_reported_to_irs=True,
+            broker_source=BrokerSource.MANUAL,
+        )
+        repo.save_sale(sale)
+
+        run = engine.reconcile(2024)
+        results = repo.get_sale_results(2024)
+        assert results[0]["holding_period"] == "SHORT_TERM"
+        assert any("Various" in w for w in run["warnings"])
+
+    def test_passthrough_no_basis_still_fails(self, repo, engine):
+        """Sale with no broker basis and no lots → unmatched."""
+        sale = Sale(
+            id="sale-pt-nobasis",
+            lot_id="",
+            security=Security(ticker="UNKNOWN", name="Mystery Stock"),
+            sale_date=date(2024, 6, 1),
+            shares=Decimal("100"),
+            proceeds_per_share=Decimal("50"),
+            broker_reported_basis=None,
+            basis_reported_to_irs=False,
+            broker_source=BrokerSource.MANUAL,
+        )
+        repo.save_sale(sale)
+
+        run = engine.reconcile(2024)
+        assert run["unmatched_sales"] == 1
+        assert run["matched_sales"] == 0
+
+    def test_espp_with_lots_not_passthrough(self, repo, engine):
+        """ESPP sale WITH matching lots should NOT use pass-through."""
+        _seed_espp_data(repo)
+        run = engine.reconcile(2024)
+
+        # Should use lot-based reconciliation, not pass-through
+        assert run["matched_sales"] == 1
+        results = repo.get_sale_results(2024)
+        assert results[0]["lot_id"] == "lot-espp-001"
+        assert "Pass-through" not in (results[0].get("notes") or "")
+
+
 class TestReconcileFuzzyMatch:
     def test_fuzzy_match_by_name(self, repo, engine):
         """Sale with UNKNOWN ticker matches lot by security name."""

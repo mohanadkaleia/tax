@@ -370,7 +370,7 @@ class TestEstimateFromDBOrdinaryIncomeWarning:
             ordinary_income=Decimal("1125"),
             amt_adjustment=Decimal("0"),
             wash_sale_disallowed=Decimal("0"),
-            notes="ESPP disqualifying",
+            notes="ESPP DISQUALIFYING disposition",
         )
         repo.save_sale_result(sr)
 
@@ -380,4 +380,5 @@ class TestEstimateFromDBOrdinaryIncomeWarning:
             filing_status=FilingStatus.SINGLE,
         )
 
-        assert any("double-counting" in w for w in engine.warnings)
+        assert any("disqualifying" in w.lower() for w in engine.warnings)
+        assert any("W-2" in w for w in engine.warnings)
