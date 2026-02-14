@@ -58,6 +58,9 @@ class ManualAdapter(BaseAdapter):
     @staticmethod
     def _detect_form_type(raw: dict | list) -> FormType:
         """Detect form type from the JSON shape and field signatures."""
+        if isinstance(raw, list) and len(raw) == 0:
+            raise ValueError("JSON file contains an empty list — no records to import")
+
         # If it's a list, inspect the first record
         sample = raw[0] if isinstance(raw, list) else raw
 

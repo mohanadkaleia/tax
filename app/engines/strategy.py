@@ -8,9 +8,11 @@ Strategies implemented:
   A.1 Tax-Loss Harvesting         A.2 Retirement Contributions
   A.3 HSA Maximization            A.4 Charitable Bunching
   A.5 SALT Analysis               B.1 ESPP Holding Period
-  C.1 Holding Period Analysis     C.3 Wash Sale Detection
-  C.4 NIIT Analysis               D.1 Income Shifting
-  D.3 Loss Carryforward           D.4 Estimated Payments
+  B.2 ISO Exercise Timing         B.3 RSU Harvesting Coordination
+  B.4 NSO Exercise Timing         C.1 Holding Period Analysis
+  C.3 Wash Sale Detection         C.4 NIIT Analysis
+  D.1 Income Shifting             D.3 Loss Carryforward
+  D.4 Estimated Payments
 
 IRS/CA authorities cited per strategy in the plan: plans/tax-strategy.md
 """
@@ -22,6 +24,9 @@ from enum import StrEnum
 from pydantic import BaseModel
 
 from app.engines.brackets import (
+    AMT_28_PERCENT_THRESHOLD,
+    AMT_EXEMPTION,
+    AMT_PHASEOUT_START,
     CAPITAL_LOSS_LIMIT,
     FEDERAL_STANDARD_DEDUCTION,
     NIIT_THRESHOLD,
@@ -96,6 +101,9 @@ class UserInputs(BaseModel):
     future_vest_dates: list[dict] | None = None
     current_market_prices: dict[str, Decimal] = {}
     planned_sales: dict[str, Decimal] = {}
+    # ISO/NSO grant data — each dict has: ticker, shares, strike_price, grant_date, expiration_date
+    unexercised_iso_grants: list[dict] | None = None
+    unexercised_nso_grants: list[dict] | None = None
 
 
 class StrategyReport(BaseModel):
@@ -271,6 +279,16 @@ class StrategyEngine:
                 sale_results, filing_status, user_inputs,
             ),
             lambda: self._analyze_income_shifting(
+                baseline, tax_year, filing_status, user_inputs,
+            ),
+            lambda: self._analyze_iso_exercise(
+                baseline, lots, events, tax_year, filing_status, user_inputs,
+            ),
+            lambda: self._analyze_rsu_harvesting(
+                baseline, lots, events, sale_results, tax_year, filing_status,
+                user_inputs,
+            ),
+            lambda: self._analyze_nso_timing(
                 baseline, tax_year, filing_status, user_inputs,
             ),
         ]:
@@ -1364,6 +1382,769 @@ class StrategyEngine:
                     california_impact="CA R&TC Section 19136",
                     irs_authority="CA R&TC Section 19136",
                 ))
+
+        return recommendations
+
+    # ------------------------------------------------------------------
+    # B.2 ISO Exercise Timing
+    # ------------------------------------------------------------------
+
+    def _analyze_iso_exercise(
+        self,
+        baseline: TaxEstimate,
+        lots: list[dict],
+        events: list[dict],
+        tax_year: int,
+        filing_status: FilingStatus,
+        user_inputs: UserInputs,
+    ) -> list[StrategyRecommendation]:
+        recommendations: list[StrategyRecommendation] = []
+        prices = user_inputs.current_market_prices
+
+        # Step 1: Compute AMT headroom via binary search
+        amt_headroom = self._compute_amt_headroom(
+            baseline, tax_year, filing_status,
+        )
+
+        # Step 2: Analyze unexercised ISO grants (from user input)
+        iso_grants = user_inputs.unexercised_iso_grants or []
+        for grant in iso_grants:
+            ticker = grant.get("ticker", "")
+            shares = Decimal(str(grant.get("shares", "0")))
+            strike_price = Decimal(str(grant.get("strike_price", "0")))
+            expiration_str = grant.get("expiration_date", "")
+
+            if ticker not in prices or shares <= Decimal("0"):
+                continue
+
+            current_price = prices[ticker]
+            spread_per_share = current_price - strike_price
+            if spread_per_share <= Decimal("0"):
+                # Underwater — no benefit to exercising
+                recommendations.append(StrategyRecommendation(
+                    name=f"ISO Analysis: {ticker} (Underwater)",
+                    category=StrategyCategory.EQUITY_COMPENSATION,
+                    priority=Priority.LOW,
+                    situation=(
+                        f"{shares:,.0f} ISOs at ${strike_price:,.2f} strike. "
+                        f"Current price: ${current_price:,.2f}. Options are underwater."
+                    ),
+                    mechanism="Underwater options have no intrinsic value to exercise.",
+                    quantified_impact="No action needed — exercise would create no benefit.",
+                    estimated_savings=Decimal("0"),
+                    action_steps=[
+                        "Monitor stock price for recovery above strike price",
+                        "Track expiration date to avoid losing options",
+                    ],
+                    risk_level=RiskLevel.LOW,
+                    california_impact="No CA impact — no exercise event.",
+                    irs_authority="IRC Sections 421-424",
+                ))
+                continue
+
+            total_spread = spread_per_share * shares
+
+            # Can the full exercise fit within AMT headroom?
+            if total_spread <= amt_headroom:
+                recommendations.append(StrategyRecommendation(
+                    name=f"ISO Exercise: {ticker} (Within AMT Headroom)",
+                    category=StrategyCategory.EQUITY_COMPENSATION,
+                    priority=Priority.HIGH,
+                    situation=(
+                        f"{shares:,.0f} ISOs at ${strike_price:,.2f} strike. "
+                        f"Current FMV: ${current_price:,.2f}. "
+                        f"Spread: ${total_spread:,.2f}. "
+                        f"AMT headroom: ${amt_headroom:,.2f}."
+                    ),
+                    mechanism=(
+                        "Exercising within AMT headroom triggers NO additional "
+                        "tax. Starts the long-term holding period clock for "
+                        "qualifying disposition treatment."
+                    ),
+                    quantified_impact=(
+                        f"Exercise creates $0 AMT. "
+                        f"Remaining AMT headroom: ${amt_headroom - total_spread:,.2f}."
+                    ),
+                    estimated_savings=Decimal("0"),
+                    action_steps=[
+                        f"Exercise all {shares:,.0f} ISO shares at ${strike_price:,.2f}",
+                        "Hold for >1 year from exercise AND >2 years from grant for qualifying disposition",
+                        f"Exercise must settle by Dec 31, {tax_year}",
+                    ],
+                    deadline=date(tax_year, 12, 30),
+                    risk_level=RiskLevel.MODERATE,
+                    california_impact=(
+                        "CA does NOT have AMT (repealed 2005). "
+                        "ISO exercise has no CA tax impact until sale. "
+                        "At sale, CA treats ISOs like NSOs for state purposes."
+                    ),
+                    irs_authority="IRC Sections 421-424, 55-59; Form 6251",
+                    warnings=[
+                        "Stock price risk: if stock drops after exercise, you still owe AMT on the spread at exercise",
+                    ],
+                ))
+            else:
+                # Compute AMT cost for full exercise
+                full_exercise_est = self.estimator.estimate(
+                    tax_year=tax_year,
+                    filing_status=filing_status,
+                    w2_wages=baseline.w2_wages,
+                    interest_income=baseline.interest_income,
+                    dividend_income=baseline.dividend_income,
+                    qualified_dividends=baseline.qualified_dividends,
+                    short_term_gains=baseline.short_term_gains,
+                    long_term_gains=baseline.long_term_gains,
+                    amt_iso_preference=total_spread,
+                )
+                amt_cost = full_exercise_est.federal_amt
+
+                # Compute how many shares fit within headroom
+                shares_in_headroom = Decimal("0")
+                if spread_per_share > Decimal("0"):
+                    shares_in_headroom = (
+                        amt_headroom / spread_per_share
+                    ).to_integral_value()
+                    shares_in_headroom = min(shares_in_headroom, shares)
+
+                # Also compare exercise+hold vs exercise+sell (disqualifying)
+                disq_est = self.estimator.estimate(
+                    tax_year=tax_year,
+                    filing_status=filing_status,
+                    w2_wages=baseline.w2_wages + total_spread,
+                    interest_income=baseline.interest_income,
+                    dividend_income=baseline.dividend_income,
+                    qualified_dividends=baseline.qualified_dividends,
+                    short_term_gains=baseline.short_term_gains,
+                    long_term_gains=baseline.long_term_gains,
+                )
+                disq_tax_increase = disq_est.total_tax - baseline.total_tax
+
+                action_steps = []
+                if shares_in_headroom > Decimal("0"):
+                    action_steps.append(
+                        f"Exercise {shares_in_headroom:,.0f} shares within AMT headroom ($0 AMT)"
+                    )
+                action_steps.extend([
+                    f"Full exercise of {shares:,.0f} shares triggers ~${amt_cost:,.0f} AMT",
+                    f"AMT paid generates a ${amt_cost:,.0f} credit carryforward (Form 8801)",
+                    f"Same-day sale (disqualifying) would add ${total_spread:,.0f} ordinary income "
+                    f"(~${disq_tax_increase:,.0f} additional tax)",
+                    f"Exercise must settle by Dec 30, {tax_year}",
+                ])
+
+                # Check expiration urgency
+                warnings = [
+                    "Stock price risk: if stock drops after exercise, AMT is still owed on spread at exercise date",
+                ]
+                if expiration_str:
+                    exp_date = date.fromisoformat(expiration_str)
+                    days_to_exp = (exp_date - date.today()).days
+                    if days_to_exp <= 90:
+                        warnings.append(
+                            f"OPTIONS EXPIRE {expiration_str} ({days_to_exp} days). "
+                            "Exercise before expiration to avoid losing value."
+                        )
+
+                recommendations.append(StrategyRecommendation(
+                    name=f"ISO Exercise: {ticker} (Exceeds AMT Headroom)",
+                    category=StrategyCategory.EQUITY_COMPENSATION,
+                    priority=Priority.HIGH,
+                    situation=(
+                        f"{shares:,.0f} ISOs at ${strike_price:,.2f} strike. "
+                        f"Current FMV: ${current_price:,.2f}. "
+                        f"Spread: ${total_spread:,.2f}. "
+                        f"AMT headroom: ${amt_headroom:,.2f}."
+                    ),
+                    mechanism=(
+                        f"Full exercise exceeds AMT headroom by "
+                        f"${total_spread - amt_headroom:,.2f}. "
+                        f"AMT of ~${amt_cost:,.0f} would be triggered. "
+                        "AMT paid on ISO exercises generates a credit "
+                        "carryforward (Form 8801) that offsets future regular tax."
+                    ),
+                    quantified_impact=(
+                        f"Exercise+hold: ${amt_cost:,.0f} AMT "
+                        f"(generates carryforward credit). "
+                        f"Exercise+sell: ${disq_tax_increase:,.0f} ordinary income tax."
+                    ),
+                    estimated_savings=Decimal("0"),
+                    action_steps=action_steps,
+                    deadline=date(tax_year, 12, 30),
+                    risk_level=RiskLevel.HIGH,
+                    california_impact=(
+                        "CA does NOT have AMT. ISO exercise has no CA tax "
+                        "impact until sale. At sale, CA treats ISOs like NSOs "
+                        "(ordinary income on spread)."
+                    ),
+                    irs_authority="IRC Sections 421-424, 55-59; Form 6251; Form 8801",
+                    warnings=warnings,
+                    interactions=["AMT Credit Carryforward"],
+                ))
+
+        # Step 3: AMT credit carryforward utilization
+        prior_amt_credit = user_inputs.amt_credit_carryforward
+        if prior_amt_credit > Decimal("0"):
+            # Credit usable = regular tax + LTCG tax - TMT (tentative minimum tax)
+            # When regular tax > TMT, the excess is available for credit
+            tmt = self._compute_tmt(baseline, tax_year, filing_status)
+            regular_plus_ltcg = (
+                baseline.federal_regular_tax + baseline.federal_ltcg_tax
+            )
+            credit_usable = max(regular_plus_ltcg - tmt, Decimal("0"))
+            credit_used = min(prior_amt_credit, credit_usable)
+
+            if credit_used > Decimal("0"):
+                remaining = prior_amt_credit - credit_used
+                recommendations.append(StrategyRecommendation(
+                    name="AMT Credit Carryforward Utilization",
+                    category=StrategyCategory.EQUITY_COMPENSATION,
+                    priority=Priority.HIGH,
+                    situation=(
+                        f"Prior AMT credit carryforward: ${prior_amt_credit:,.0f}. "
+                        f"Usable this year: ${credit_used:,.0f}."
+                    ),
+                    mechanism=(
+                        "AMT credits from prior ISO exercises offset current "
+                        "regular tax. Per Form 8801, the credit equals the "
+                        "excess of regular tax over tentative minimum tax."
+                    ),
+                    quantified_impact=f"${credit_used:,.0f} AMT credit reduces federal tax.",
+                    estimated_savings=credit_used,
+                    action_steps=[
+                        "File Form 8801 with your return to claim the credit",
+                        f"Remaining carryforward after use: ${remaining:,.0f}",
+                    ],
+                    deadline=date(tax_year + 1, 4, 15),
+                    risk_level=RiskLevel.LOW,
+                    california_impact="CA does not have AMT credit — federal benefit only.",
+                    irs_authority="IRC Section 53; Form 8801",
+                ))
+            elif prior_amt_credit > Decimal("0"):
+                recommendations.append(StrategyRecommendation(
+                    name="AMT Credit Carryforward (Not Usable This Year)",
+                    category=StrategyCategory.EQUITY_COMPENSATION,
+                    priority=Priority.LOW,
+                    situation=(
+                        f"Prior AMT credit: ${prior_amt_credit:,.0f}. "
+                        "Regular tax does not exceed TMT this year — "
+                        "credit cannot be used."
+                    ),
+                    mechanism=(
+                        "The credit carries forward indefinitely. It becomes "
+                        "usable when regular tax exceeds the tentative "
+                        "minimum tax in a future year."
+                    ),
+                    quantified_impact="$0 usable this year. Credit carries forward.",
+                    estimated_savings=Decimal("0"),
+                    action_steps=[
+                        f"Carry ${prior_amt_credit:,.0f} AMT credit forward to next year",
+                        "Track on Form 8801 each year",
+                    ],
+                    risk_level=RiskLevel.LOW,
+                    irs_authority="IRC Section 53; Form 8801",
+                ))
+
+        return recommendations
+
+    def _compute_amt_headroom(
+        self,
+        baseline: TaxEstimate,
+        tax_year: int,
+        filing_status: FilingStatus,
+    ) -> Decimal:
+        """Binary search for maximum ISO spread that produces $0 AMT."""
+        # If already paying AMT, headroom is 0
+        if baseline.federal_amt > Decimal("0"):
+            return Decimal("0")
+
+        low = Decimal("0")
+        high = Decimal("500000")
+
+        # Quick check: if even max produces no AMT, return max
+        test_high = self.estimator.estimate(
+            tax_year=tax_year,
+            filing_status=filing_status,
+            w2_wages=baseline.w2_wages,
+            interest_income=baseline.interest_income,
+            dividend_income=baseline.dividend_income,
+            qualified_dividends=baseline.qualified_dividends,
+            short_term_gains=baseline.short_term_gains,
+            long_term_gains=baseline.long_term_gains,
+            amt_iso_preference=high,
+        )
+        if test_high.federal_amt == Decimal("0"):
+            return high
+
+        # Binary search
+        for _ in range(30):  # converge within $100
+            if high - low <= Decimal("100"):
+                break
+            mid = (low + high) / 2
+            test_est = self.estimator.estimate(
+                tax_year=tax_year,
+                filing_status=filing_status,
+                w2_wages=baseline.w2_wages,
+                interest_income=baseline.interest_income,
+                dividend_income=baseline.dividend_income,
+                qualified_dividends=baseline.qualified_dividends,
+                short_term_gains=baseline.short_term_gains,
+                long_term_gains=baseline.long_term_gains,
+                amt_iso_preference=mid,
+            )
+            if test_est.federal_amt > Decimal("0"):
+                high = mid
+            else:
+                low = mid
+
+        return low
+
+    def _compute_tmt(
+        self,
+        baseline: TaxEstimate,
+        tax_year: int,
+        filing_status: FilingStatus,
+    ) -> Decimal:
+        """Compute tentative minimum tax (without ISO preferences) for AMT credit calc."""
+        exemptions = AMT_EXEMPTION.get(tax_year, {})
+        phaseouts = AMT_PHASEOUT_START.get(tax_year, {})
+        threshold_28 = AMT_28_PERCENT_THRESHOLD.get(tax_year, Decimal("232600"))
+
+        exemption = exemptions.get(filing_status, Decimal("85700"))
+        phaseout_start = phaseouts.get(filing_status, Decimal("609350"))
+
+        # AMTI = taxable income (no ISO preferences)
+        amti = baseline.taxable_income
+
+        # Phase out exemption
+        if amti > phaseout_start:
+            reduction = (amti - phaseout_start) * Decimal("0.25")
+            exemption = max(exemption - reduction, Decimal("0"))
+
+        amt_base = max(amti - exemption, Decimal("0"))
+
+        # Two-tier AMT rates: 26% up to threshold, 28% above
+        if filing_status == FilingStatus.MFS:
+            threshold_28 = threshold_28 / 2
+
+        if amt_base <= threshold_28:
+            tmt = amt_base * Decimal("0.26")
+        else:
+            tmt = (
+                threshold_28 * Decimal("0.26")
+                + (amt_base - threshold_28) * Decimal("0.28")
+            )
+
+        return tmt
+
+    # ------------------------------------------------------------------
+    # B.3 RSU Harvesting Coordination
+    # ------------------------------------------------------------------
+
+    def _analyze_rsu_harvesting(
+        self,
+        baseline: TaxEstimate,
+        lots: list[dict],
+        events: list[dict],
+        sale_results: list[dict],
+        tax_year: int,
+        filing_status: FilingStatus,
+        user_inputs: UserInputs,
+    ) -> list[StrategyRecommendation]:
+        recommendations: list[StrategyRecommendation] = []
+        prices = user_inputs.current_market_prices
+        if not prices:
+            return recommendations
+
+        today = date.today()
+        future_vests = user_inputs.future_vest_dates or []
+
+        # Find RSU lots with unrealized losses
+        rsu_lots = [
+            lot for lot in lots
+            if lot.get("equity_type") == "RSU"
+            and Decimal(str(lot.get("shares_remaining", "0"))) > Decimal("0")
+        ]
+
+        for lot in rsu_lots:
+            ticker = lot.get("ticker", "")
+            if ticker not in prices:
+                continue
+
+            current_price = prices[ticker]
+            cost_per_share = Decimal(str(lot["cost_per_share"]))
+            shares_remaining = Decimal(str(lot["shares_remaining"]))
+            unrealized = (current_price - cost_per_share) * shares_remaining
+
+            if unrealized >= Decimal("0"):
+                continue  # Only interested in losses
+
+            acq_date_str = lot.get("acquisition_date", "")
+            if not acq_date_str:
+                continue
+            acq_date = date.fromisoformat(acq_date_str)
+            is_long_term = (today - acq_date).days > 365
+            holding_label = "long-term" if is_long_term else "short-term"
+
+            # Check for upcoming RSU vests (wash sale risk)
+            upcoming_vests_for_ticker = []
+
+            # Check future_vest_dates from user input
+            for fv in future_vests:
+                fv_ticker = fv.get("ticker", "")
+                fv_date_str = fv.get("vest_date", fv.get("date", ""))
+                if fv_ticker != ticker or not fv_date_str:
+                    continue
+                fv_date = date.fromisoformat(fv_date_str)
+                if today <= fv_date <= today + timedelta(days=60):
+                    upcoming_vests_for_ticker.append(fv)
+
+            # Also check events in the database for upcoming vests
+            for event in events:
+                if event.get("ticker") != ticker:
+                    continue
+                if event.get("event_type") not in ("VEST", "PURCHASE"):
+                    continue
+                ev_date_str = event.get("event_date", "")
+                if not ev_date_str:
+                    continue
+                ev_date = date.fromisoformat(ev_date_str)
+                if today <= ev_date <= today + timedelta(days=60):
+                    upcoming_vests_for_ticker.append(event)
+
+            # What-if: harvest this RSU loss
+            if is_long_term:
+                mod_st, mod_lt = _net_capital_losses(
+                    baseline.short_term_gains,
+                    baseline.long_term_gains + unrealized,
+                    filing_status,
+                )
+            else:
+                mod_st, mod_lt = _net_capital_losses(
+                    baseline.short_term_gains + unrealized,
+                    baseline.long_term_gains,
+                    filing_status,
+                )
+
+            modified = self.estimator.estimate(
+                tax_year=tax_year,
+                filing_status=filing_status,
+                w2_wages=baseline.w2_wages,
+                interest_income=baseline.interest_income,
+                dividend_income=baseline.dividend_income,
+                qualified_dividends=baseline.qualified_dividends,
+                short_term_gains=mod_st,
+                long_term_gains=mod_lt,
+            )
+            savings = baseline.total_tax - modified.total_tax
+
+            if savings <= Decimal("0"):
+                continue
+
+            warnings = []
+            action_steps = []
+
+            if upcoming_vests_for_ticker:
+                # Wash sale risk exists
+                vest_info = upcoming_vests_for_ticker[0]
+                vest_date_str = vest_info.get(
+                    "vest_date", vest_info.get("date", vest_info.get("event_date", ""))
+                )
+                vest_date = date.fromisoformat(vest_date_str) if vest_date_str else None
+
+                if vest_date:
+                    safe_sell_before = vest_date - timedelta(days=31)
+                    safe_sell_after = vest_date + timedelta(days=31)
+                    warnings.append(
+                        f"RSU vest on {vest_date} creates wash sale risk. "
+                        f"Sell before {safe_sell_before} or after {safe_sell_after} "
+                        "to avoid wash sale."
+                    )
+                    if safe_sell_before >= today:
+                        action_steps.append(
+                            f"Sell {shares_remaining:,.0f} shares before {safe_sell_before} "
+                            f"to avoid wash sale from {vest_date} vest"
+                        )
+                    else:
+                        action_steps.append(
+                            f"Wait until after {safe_sell_after} to harvest "
+                            f"(too close to {vest_date} vest)"
+                        )
+                else:
+                    warnings.append(
+                        f"Upcoming RSU vest for {ticker} may trigger wash sale."
+                    )
+            else:
+                action_steps.append(
+                    f"Sell {shares_remaining:,.0f} shares of {ticker} to harvest "
+                    f"${abs(unrealized):,.2f} {holding_label} loss"
+                )
+
+            action_steps.extend([
+                "Wait 31 days before repurchasing to avoid wash sale",
+                "Consider buying a correlated ETF during the waiting period",
+            ])
+
+            recommendations.append(StrategyRecommendation(
+                name=f"RSU Harvest: {ticker}",
+                category=StrategyCategory.EQUITY_COMPENSATION,
+                priority=(
+                    Priority.HIGH if savings > Decimal("1000") else Priority.MEDIUM
+                ),
+                situation=(
+                    f"RSU lot: {shares_remaining:,.0f} shares vested {acq_date}, "
+                    f"cost ${cost_per_share:,.2f}. Current: ${current_price:,.2f}. "
+                    f"Unrealized {holding_label} loss: ${abs(unrealized):,.2f}."
+                ),
+                mechanism=(
+                    "Selling depreciated RSU shares realizes the capital loss, "
+                    "offsetting realized gains and reducing tax liability."
+                ),
+                quantified_impact=f"Estimated tax savings: ${savings:,.2f}.",
+                estimated_savings=savings,
+                action_steps=action_steps,
+                deadline=date(tax_year, 12, 31),
+                risk_level=(
+                    RiskLevel.MODERATE if upcoming_vests_for_ticker
+                    else RiskLevel.LOW
+                ),
+                california_impact=(
+                    "CA treats all capital gains/losses at ordinary rates. "
+                    "Loss harvesting reduces CA tax as well."
+                ),
+                irs_authority="IRC Sections 1211(b), 1212(b), 1091; Pub 550",
+                warnings=warnings,
+                interactions=["Wash Sale Warning", "Tax-Loss Harvesting"],
+            ))
+
+        return recommendations
+
+    # ------------------------------------------------------------------
+    # B.4 NSO Exercise Timing
+    # ------------------------------------------------------------------
+
+    def _analyze_nso_timing(
+        self,
+        baseline: TaxEstimate,
+        tax_year: int,
+        filing_status: FilingStatus,
+        user_inputs: UserInputs,
+    ) -> list[StrategyRecommendation]:
+        recommendations: list[StrategyRecommendation] = []
+        prices = user_inputs.current_market_prices
+        nso_grants = user_inputs.unexercised_nso_grants or []
+
+        if not nso_grants or not prices:
+            return recommendations
+
+        today = date.today()
+
+        for grant in nso_grants:
+            ticker = grant.get("ticker", "")
+            shares = Decimal(str(grant.get("shares", "0")))
+            strike_price = Decimal(str(grant.get("strike_price", "0")))
+            expiration_str = grant.get("expiration_date", "")
+
+            if ticker not in prices or shares <= Decimal("0"):
+                continue
+
+            current_price = prices[ticker]
+            spread_per_share = current_price - strike_price
+            total_spread = spread_per_share * shares
+
+            if total_spread <= Decimal("0"):
+                # Underwater
+                warnings = []
+                if expiration_str:
+                    exp_date = date.fromisoformat(expiration_str)
+                    days_to_exp = (exp_date - today).days
+                    if days_to_exp <= 90:
+                        warnings.append(
+                            f"Options expire {expiration_str} ({days_to_exp} days). "
+                            "Monitor stock price."
+                        )
+                recommendations.append(StrategyRecommendation(
+                    name=f"NSO Analysis: {ticker} (Underwater)",
+                    category=StrategyCategory.EQUITY_COMPENSATION,
+                    priority=Priority.LOW,
+                    situation=(
+                        f"{shares:,.0f} NSOs at ${strike_price:,.2f} strike. "
+                        f"Current price: ${current_price:,.2f}. Options are underwater."
+                    ),
+                    mechanism="Underwater NSOs have no intrinsic value.",
+                    quantified_impact="No action needed.",
+                    estimated_savings=Decimal("0"),
+                    action_steps=["Monitor stock price for recovery"],
+                    risk_level=RiskLevel.LOW,
+                    irs_authority="IRC Section 83; Pub 525",
+                    warnings=warnings,
+                ))
+                continue
+
+            # Option 1: Exercise this year — spread is ordinary income
+            exercise_this_year = self.estimator.estimate(
+                tax_year=tax_year,
+                filing_status=filing_status,
+                w2_wages=baseline.w2_wages + total_spread,
+                interest_income=baseline.interest_income,
+                dividend_income=baseline.dividend_income,
+                qualified_dividends=baseline.qualified_dividends,
+                short_term_gains=baseline.short_term_gains,
+                long_term_gains=baseline.long_term_gains,
+            )
+            tax_this_year = exercise_this_year.total_tax - baseline.total_tax
+
+            # Option 2: Exercise next year
+            projected = user_inputs.projected_income_next_year
+            tax_next_year = None
+            savings = Decimal("0")
+
+            if projected is not None and projected > Decimal("0"):
+                try:
+                    next_baseline = self.estimator.estimate(
+                        tax_year=tax_year + 1,
+                        filing_status=filing_status,
+                        w2_wages=projected,
+                    )
+                    next_with_exercise = self.estimator.estimate(
+                        tax_year=tax_year + 1,
+                        filing_status=filing_status,
+                        w2_wages=projected + total_spread,
+                    )
+                    tax_next_year = next_with_exercise.total_tax - next_baseline.total_tax
+                    savings = tax_this_year - tax_next_year
+                except (ValueError, KeyError):
+                    pass
+
+            # Check expiration urgency
+            warnings = []
+            exp_urgent = False
+            if expiration_str:
+                exp_date = date.fromisoformat(expiration_str)
+                days_to_exp = (exp_date - today).days
+                if days_to_exp <= 90:
+                    exp_urgent = True
+                    warnings.append(
+                        f"OPTIONS EXPIRE {expiration_str} ({days_to_exp} days). "
+                        "Exercise before expiration or lose the options."
+                    )
+
+            if savings > Decimal("500") and not exp_urgent:
+                # Deferral is beneficial
+                recommendations.append(StrategyRecommendation(
+                    name=f"NSO Timing: Defer {ticker} Exercise",
+                    category=StrategyCategory.EQUITY_COMPENSATION,
+                    priority=(
+                        Priority.HIGH if savings > Decimal("5000")
+                        else Priority.MEDIUM
+                    ),
+                    situation=(
+                        f"{shares:,.0f} NSOs at ${strike_price:,.2f} strike. "
+                        f"Spread: ${total_spread:,.2f}. "
+                        f"Tax if exercised this year: ~${tax_this_year:,.0f}. "
+                        f"Tax if exercised next year: ~${tax_next_year:,.0f}."
+                    ),
+                    mechanism=(
+                        "NSO exercise spread is ordinary income (IRC Section 83). "
+                        "Deferring to a lower-income year reduces the marginal rate."
+                    ),
+                    quantified_impact=(
+                        f"Deferring saves ~${savings:,.0f} "
+                        f"(${tax_this_year:,.0f} this year vs ${tax_next_year:,.0f} next year)."
+                    ),
+                    estimated_savings=savings,
+                    action_steps=[
+                        f"Defer exercise of {shares:,.0f} NSO shares to {tax_year + 1}",
+                        "Monitor stock price — deferral carries stock price risk",
+                        "Verify exercise window is available next year",
+                    ],
+                    deadline=None,
+                    risk_level=RiskLevel.MODERATE,
+                    california_impact=(
+                        "CA taxes NSO spread as ordinary income at exercise. "
+                        "Deferral benefits apply to both federal and CA tax."
+                    ),
+                    irs_authority="IRC Section 83; Pub 525",
+                    warnings=warnings,
+                    interactions=["Income Shifting"],
+                ))
+            elif savings < Decimal("-500"):
+                # Exercise this year is better (or next year is higher income)
+                benefit = abs(savings)
+                recommendations.append(StrategyRecommendation(
+                    name=f"NSO Timing: Exercise {ticker} This Year",
+                    category=StrategyCategory.EQUITY_COMPENSATION,
+                    priority=(
+                        Priority.HIGH if benefit > Decimal("5000")
+                        else Priority.MEDIUM
+                    ),
+                    situation=(
+                        f"{shares:,.0f} NSOs at ${strike_price:,.2f} strike. "
+                        f"Spread: ${total_spread:,.2f}. "
+                        f"Tax if exercised this year: ~${tax_this_year:,.0f}."
+                    ),
+                    mechanism=(
+                        "Next year's projected income is higher. Exercising "
+                        "this year captures the spread at a lower marginal rate."
+                    ),
+                    quantified_impact=(
+                        f"Exercising this year saves ~${benefit:,.0f} vs deferring."
+                    ),
+                    estimated_savings=benefit,
+                    action_steps=[
+                        f"Exercise {shares:,.0f} NSO shares before Dec 31, {tax_year}",
+                        "Consider selling shares immediately to reduce stock concentration",
+                    ],
+                    deadline=date(tax_year, 12, 31),
+                    risk_level=RiskLevel.LOW,
+                    california_impact=(
+                        "CA taxes NSO spread as ordinary income at exercise. "
+                        "Exercising this year also reduces CA tax."
+                    ),
+                    irs_authority="IRC Section 83; Pub 525",
+                    warnings=warnings,
+                ))
+            else:
+                # No meaningful difference — informational
+                action_steps = [
+                    f"Exercise {shares:,.0f} NSO shares when convenient — "
+                    "no significant timing advantage",
+                ]
+                if exp_urgent:
+                    action_steps.insert(0, "Exercise before expiration!")
+
+                if total_spread > Decimal("0"):
+                    recommendations.append(StrategyRecommendation(
+                        name=f"NSO Exercise: {ticker}",
+                        category=StrategyCategory.EQUITY_COMPENSATION,
+                        priority=Priority.HIGH if exp_urgent else Priority.LOW,
+                        situation=(
+                            f"{shares:,.0f} NSOs at ${strike_price:,.2f} strike. "
+                            f"Spread: ${total_spread:,.2f}. "
+                            f"Tax on exercise: ~${tax_this_year:,.0f}."
+                        ),
+                        mechanism=(
+                            "NSO exercise creates ordinary income. "
+                            "No significant rate differential between years."
+                        ),
+                        quantified_impact=(
+                            f"Tax cost on exercise: ~${tax_this_year:,.0f}. "
+                            "No deferral advantage."
+                        ),
+                        estimated_savings=Decimal("0"),
+                        action_steps=action_steps,
+                        deadline=(
+                            date.fromisoformat(expiration_str) if expiration_str
+                            else None
+                        ),
+                        risk_level=(
+                            RiskLevel.HIGH if exp_urgent else RiskLevel.LOW
+                        ),
+                        california_impact=(
+                            "CA taxes NSO spread as ordinary income at exercise."
+                        ),
+                        irs_authority="IRC Section 83; Pub 525",
+                        warnings=warnings,
+                    ))
 
         return recommendations
 

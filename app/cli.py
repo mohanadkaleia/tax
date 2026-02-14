@@ -424,6 +424,22 @@ def strategy(
     projected_income: float | None = typer.Option(
         None, "--projected-income", help="Projected W-2 income next year",
     ),
+    has_hdhp: bool = typer.Option(False, "--hdhp", help="Has high-deductible health plan (HSA eligible)"),
+    hsa_coverage: str | None = typer.Option(
+        None, "--hsa-coverage", help="HSA coverage type: self or family",
+    ),
+    iso_grants_file: Path | None = typer.Option(
+        None, "--iso-grants",
+        help="JSON file with unexercised ISO grants: [{ticker, shares, strike_price, expiration_date}]",
+    ),
+    nso_grants_file: Path | None = typer.Option(
+        None, "--nso-grants",
+        help="JSON file with unexercised NSO grants: [{ticker, shares, strike_price, expiration_date}]",
+    ),
+    future_vests_file: Path | None = typer.Option(
+        None, "--future-vests",
+        help="JSON file with future RSU vest dates: [{ticker, vest_date, shares}]",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
     top_n: int = typer.Option(10, "--top", "-n", help="Show top N recommendations"),
 ) -> None:
@@ -459,8 +475,26 @@ def strategy(
             raw_prices = json.load(f)
             market_prices = {k: Decimal(str(v)) for k, v in raw_prices.items()}
 
+    # Load ISO/NSO grants from JSON files
+    iso_grants = None
+    if iso_grants_file and iso_grants_file.exists():
+        with open(iso_grants_file) as f:
+            iso_grants = json.load(f)
+
+    nso_grants = None
+    if nso_grants_file and nso_grants_file.exists():
+        with open(nso_grants_file) as f:
+            nso_grants = json.load(f)
+
+    future_vests = None
+    if future_vests_file and future_vests_file.exists():
+        with open(future_vests_file) as f:
+            future_vests = json.load(f)
+
     user_inputs = UserInputs(
         age=age,
+        has_hdhp=has_hdhp,
+        hsa_coverage=hsa_coverage,
         annual_charitable_giving=Decimal(str(charitable)),
         property_tax=Decimal(str(property_tax)),
         mortgage_interest=Decimal(str(mortgage_interest)),
@@ -470,6 +504,9 @@ def strategy(
         capital_loss_carryforward=Decimal(str(loss_carryforward)),
         projected_income_next_year=Decimal(str(projected_income)) if projected_income is not None else None,
         current_market_prices=market_prices,
+        unexercised_iso_grants=iso_grants,
+        unexercised_nso_grants=nso_grants,
+        future_vest_dates=future_vests,
     )
 
     typer.echo(f"Analyzing tax strategies for year {year} (filing status: {fs_key})...")
