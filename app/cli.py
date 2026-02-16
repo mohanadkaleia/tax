@@ -347,6 +347,21 @@ def estimate(
         "--medicare-withheld",
         help="Medicare tax withheld (W-2 Box 6) — override auto-extraction from DB",
     ),
+    st_loss_carryover: float | None = typer.Option(
+        None,
+        "--st-loss-carryover",
+        help="Short-term capital loss carryover from prior year (positive number)",
+    ),
+    lt_loss_carryover: float | None = typer.Option(
+        None,
+        "--lt-loss-carryover",
+        help="Long-term capital loss carryover from prior year (positive number)",
+    ),
+    amt_credit_carryover: float | None = typer.Option(
+        None,
+        "--amt-credit-carryover",
+        help="AMT credit carryforward from prior year (Form 8801, deferral items only)",
+    ),
 ) -> None:
     """Compute estimated tax liability for a tax year."""
     import json
@@ -402,6 +417,13 @@ def estimate(
     mw_override = Decimal(str(medicare_wages)) if medicare_wages is not None else None
     mwh_override = Decimal(str(medicare_withheld)) if medicare_withheld is not None else None
 
+    # Capital loss carryover
+    st_co = Decimal(str(st_loss_carryover)) if st_loss_carryover is not None else Decimal("0")
+    lt_co = Decimal(str(lt_loss_carryover)) if lt_loss_carryover is not None else Decimal("0")
+
+    # AMT credit carryover
+    amt_credit = Decimal(str(amt_credit_carryover)) if amt_credit_carryover is not None else Decimal("0")
+
     typer.echo(f"Estimating tax for year {year} (filing status: {fs_key})...")
     result = engine.estimate_from_db(
         repo=repo,
@@ -413,6 +435,9 @@ def estimate(
         itemized_detail=itemized_detail,
         medicare_wages_override=mw_override,
         medicare_tax_withheld_override=mwh_override,
+        st_loss_carryover=st_co,
+        lt_loss_carryover=lt_co,
+        prior_year_amt_credit=amt_credit,
     )
     conn.close()
 
@@ -429,6 +454,23 @@ def estimate(
     typer.echo("  ──────────────────────────────────────")
     typer.echo(f"  Total Income:          ${result.total_income:>12,.2f}")
     typer.echo(f"  AGI:                   ${result.agi:>12,.2f}")
+    if (
+        result.st_loss_carryover_applied > 0
+        or result.lt_loss_carryover_applied > 0
+        or result.st_loss_carryforward > 0
+        or result.lt_loss_carryforward > 0
+    ):
+        typer.echo("")
+        typer.echo("CAPITAL LOSS CARRYOVER")
+        if result.st_loss_carryover_applied > 0:
+            typer.echo(f"  ST Carryover Applied:  ${result.st_loss_carryover_applied:>12,.2f}")
+        if result.lt_loss_carryover_applied > 0:
+            typer.echo(f"  LT Carryover Applied:  ${result.lt_loss_carryover_applied:>12,.2f}")
+        typer.echo("  ──────────────────────────────────────")
+        if result.st_loss_carryforward > 0:
+            typer.echo(f"  New ST Carryforward:   ${result.st_loss_carryforward:>12,.2f}")
+        if result.lt_loss_carryforward > 0:
+            typer.echo(f"  New LT Carryforward:   ${result.lt_loss_carryforward:>12,.2f}")
     typer.echo("")
     typer.echo("DEDUCTIONS")
     detail = result.itemized_detail
@@ -459,6 +501,8 @@ def estimate(
         if result.itemized_deductions:
             typer.echo(f"  Itemized Deductions:   ${result.itemized_deductions:>12,.2f}")
         typer.echo(f"  Deduction Used:        ${result.deduction_used:>12,.2f}")
+    if result.section_199a_deduction > 0:
+        typer.echo(f"  Section 199A QBI:     -${result.section_199a_deduction:>12,.2f}")
     typer.echo(f"  Taxable Income:        ${result.taxable_income:>12,.2f}")
     typer.echo("")
     typer.echo("FEDERAL TAX")
@@ -468,6 +512,10 @@ def estimate(
     typer.echo(f"  AMT:                   ${result.federal_amt:>12,.2f}")
     if result.additional_medicare_tax > 0:
         typer.echo(f"  Addl Medicare Tax:     ${result.additional_medicare_tax:>12,.2f}")
+    if result.amt_credit_used > 0:
+        typer.echo(f"  AMT Credit (8801):    -${result.amt_credit_used:>12,.2f}")
+    if result.federal_foreign_tax_credit > 0:
+        typer.echo(f"  Foreign Tax Credit:   -${result.federal_foreign_tax_credit:>12,.2f}")
     typer.echo("  ──────────────────────────────────────")
     typer.echo(f"  Total Federal Tax:     ${result.federal_total_tax:>12,.2f}")
     typer.echo(f"  Federal Withheld:      ${result.federal_withheld:>12,.2f}")
@@ -476,6 +524,8 @@ def estimate(
     if result.federal_estimated_payments > 0:
         typer.echo(f"  Est. Payments:         ${result.federal_estimated_payments:>12,.2f}")
     typer.echo(f"  Federal Balance Due:   ${result.federal_balance_due:>12,.2f}")
+    if result.amt_credit_carryforward > 0:
+        typer.echo(f"  AMT Credit Carryforward: ${result.amt_credit_carryforward:>10,.2f}")
     typer.echo("")
     typer.echo("CALIFORNIA TAX")
     typer.echo(f"  CA Taxable Income:     ${result.ca_taxable_income:>12,.2f}")
@@ -694,10 +744,354 @@ def strategy(
 def report(
     year: int = typer.Argument(..., help="Tax year for report generation"),
     output: Path = typer.Option("reports/", help="Output directory for reports"),
+    db: Path = typer.Option(
+        Path.home() / ".taxbot" / "taxbot.db",
+        "--db",
+        help="Path to the SQLite database file",
+    ),
+    filing_status: str = typer.Option(
+        "SINGLE",
+        "--filing-status",
+        "-s",
+        help="Filing status: SINGLE, MFJ, MFS, HOH",
+    ),
 ) -> None:
     """Generate all tax reports for a tax year."""
+    from datetime import date as date_type
+
+    from app.db.repository import TaxRepository
+    from app.db.schema import create_schema
+    from app.engines.estimator import TaxEstimator
+    from app.engines.strategy import StrategyEngine, UserInputs
+    from app.models.enums import (
+        AdjustmentCode,
+        FilingStatus,
+        Form8949Category,
+        HoldingPeriod,
+    )
+    from app.models.equity_event import SaleResult, Security
+    from app.models.reports import AMTWorksheetLine, ESPPIncomeLine, ReconciliationLine
+    from app.reports import (
+        AMTWorksheetGenerator,
+        ESPPReportGenerator,
+        Form8949Generator,
+        ReconciliationReportGenerator,
+        StrategyReportGenerator,
+        TaxSummaryGenerator,
+    )
+
+    # Validate filing status
+    status_map = {
+        "SINGLE": "SINGLE",
+        "MFJ": "MARRIED_FILING_JOINTLY",
+        "MFS": "MARRIED_FILING_SEPARATELY",
+        "HOH": "HEAD_OF_HOUSEHOLD",
+    }
+    fs_key = filing_status.upper()
+    fs_value = status_map.get(fs_key, fs_key)
+    try:
+        fs = FilingStatus(fs_value)
+    except ValueError:
+        valid = ", ".join(status_map.keys())
+        typer.echo(f"Error: Invalid filing status '{filing_status}'. Valid: {valid}", err=True)
+        raise typer.Exit(1)
+
+    if not db.exists():
+        typer.echo("Error: No database found. Import data first with `taxbot import-data`.", err=True)
+        raise typer.Exit(1)
+
+    conn = create_schema(db)
+    repo = TaxRepository(conn)
+
+    # Create output directory
+    output.mkdir(parents=True, exist_ok=True)
+
     typer.echo(f"Generating reports for year {year} to {output}...")
-    typer.echo("Report generation not yet implemented.")
+    typer.echo("")
+
+    reports_generated = 0
+
+    # Load sale results once (used by multiple reports)
+    sale_result_rows = repo.get_sale_results(year)
+
+    # Pre-build sale map for security lookups
+    sale_rows = repo.get_sales(year)
+    sale_map = {s["id"]: s for s in sale_rows}
+
+    # Pre-build lot map for equity_type lookups
+    lot_rows = repo.get_lots()
+    lot_map = {lt["id"]: lt for lt in lot_rows}
+
+    def _build_sale_result_fast(row: dict) -> SaleResult:
+        """Reconstruct a SaleResult model using pre-loaded maps."""
+        sale_row = sale_map.get(row["sale_id"], {})
+        ticker = sale_row.get("ticker", "UNKNOWN")
+        sec_name = sale_row.get("security_name", ticker)
+
+        return SaleResult(
+            sale_id=row["sale_id"],
+            lot_id=row.get("lot_id"),
+            security=Security(ticker=ticker, name=sec_name),
+            acquisition_date=date_type.fromisoformat(row["acquisition_date"]),
+            sale_date=date_type.fromisoformat(row["sale_date"]),
+            shares=Decimal(str(row["shares"])),
+            proceeds=Decimal(str(row["proceeds"])),
+            broker_reported_basis=(
+                Decimal(str(row["broker_reported_basis"]))
+                if row.get("broker_reported_basis") is not None
+                else None
+            ),
+            correct_basis=Decimal(str(row["correct_basis"])),
+            adjustment_amount=Decimal(str(row["adjustment_amount"])),
+            adjustment_code=AdjustmentCode(row["adjustment_code"]),
+            holding_period=HoldingPeriod(row["holding_period"]),
+            form_8949_category=Form8949Category(row["form_8949_category"]),
+            gain_loss=Decimal(str(row["gain_loss"])),
+            ordinary_income=Decimal(str(row.get("ordinary_income", "0"))),
+            amt_adjustment=Decimal(str(row.get("amt_adjustment", "0"))),
+            wash_sale_disallowed=Decimal(str(row.get("wash_sale_disallowed", "0"))),
+            notes=row.get("notes"),
+        )
+
+    # --- 1. Form 8949 Report ---
+    if sale_result_rows:
+        try:
+            sale_results = [_build_sale_result_fast(r) for r in sale_result_rows]
+            gen = Form8949Generator()
+            lines = gen.generate_lines(sale_results)
+            content = gen.render(lines)
+            path = output / f"{year}_form8949.txt"
+            path.write_text(content)
+            typer.echo(f"  [+] Form 8949:         {path}")
+            reports_generated += 1
+        except Exception as exc:
+            typer.echo(f"  [!] Form 8949 failed: {exc}", err=True)
+    else:
+        typer.echo("  [-] Form 8949:         skipped (no sale results)")
+
+    # --- 2. Reconciliation Report ---
+    if sale_result_rows:
+        try:
+            recon_lines: list[ReconciliationLine] = []
+            for row in sale_result_rows:
+                sale_row = sale_map.get(row["sale_id"], {})
+                ticker = sale_row.get("ticker", "UNKNOWN")
+                broker_basis = (
+                    Decimal(str(row["broker_reported_basis"]))
+                    if row.get("broker_reported_basis") is not None
+                    else None
+                )
+                correct_basis = Decimal(str(row["correct_basis"]))
+                proceeds = Decimal(str(row["proceeds"]))
+                gain_loss_correct = Decimal(str(row["gain_loss"]))
+                gain_loss_broker = (
+                    (proceeds - broker_basis) if broker_basis is not None else None
+                )
+                difference = (
+                    (gain_loss_correct - gain_loss_broker)
+                    if gain_loss_broker is not None
+                    else gain_loss_correct
+                )
+
+                recon_lines.append(ReconciliationLine(
+                    sale_id=row["sale_id"],
+                    security=ticker,
+                    sale_date=date_type.fromisoformat(row["sale_date"]),
+                    shares=Decimal(str(row["shares"])),
+                    broker_proceeds=proceeds,
+                    broker_basis=broker_basis,
+                    correct_basis=correct_basis,
+                    adjustment=Decimal(str(row["adjustment_amount"])),
+                    adjustment_code=AdjustmentCode(row["adjustment_code"]),
+                    gain_loss_broker=gain_loss_broker,
+                    gain_loss_correct=gain_loss_correct,
+                    difference=difference,
+                    notes=row.get("notes"),
+                ))
+
+            gen_recon = ReconciliationReportGenerator()
+            content = gen_recon.render(recon_lines)
+            path = output / f"{year}_reconciliation.txt"
+            path.write_text(content)
+            typer.echo(f"  [+] Reconciliation:    {path}")
+            reports_generated += 1
+        except Exception as exc:
+            typer.echo(f"  [!] Reconciliation failed: {exc}", err=True)
+    else:
+        typer.echo("  [-] Reconciliation:    skipped (no sale results)")
+
+    # --- 3. ESPP Income Report ---
+    espp_rows = [
+        r for r in sale_result_rows
+        if lot_map.get(r.get("lot_id"), {}).get("equity_type") == "ESPP"
+    ]
+    if espp_rows:
+        try:
+            from app.models.enums import DispositionType
+
+            espp_lines: list[ESPPIncomeLine] = []
+            events = repo.get_events(equity_type="ESPP")
+            event_map: dict[str, dict] = {}
+            for ev in events:
+                key = ev.get("ticker", "")
+                if key not in event_map:
+                    event_map[key] = ev
+
+            for row in espp_rows:
+                lot = lot_map.get(row.get("lot_id"), {})
+                ticker = lot.get("ticker", "UNKNOWN")
+                acq_date = date_type.fromisoformat(row["acquisition_date"])
+                sale_date = date_type.fromisoformat(row["sale_date"])
+
+                # Find associated event for offering/purchase details
+                ev = event_map.get(ticker, {})
+                offering_date = (
+                    date_type.fromisoformat(ev["offering_date"])
+                    if ev.get("offering_date")
+                    else acq_date
+                )
+                purchase_date = acq_date
+                fmv_at_purchase = Decimal(str(ev.get("price_per_share", "0")))
+                fmv_at_offering = Decimal(str(ev.get("fmv_on_offering_date", "0")))
+                purchase_price = Decimal(str(ev.get("purchase_price", "0")))
+
+                proceeds = Decimal(str(row["proceeds"]))
+                ordinary_income = Decimal(str(row.get("ordinary_income", "0")))
+                correct_basis = Decimal(str(row["correct_basis"]))
+                capital_gain_loss = Decimal(str(row["gain_loss"]))
+                holding = HoldingPeriod(row["holding_period"])
+
+                # Determine disposition type from holding period and dates
+                def _add_years(d: date_type, years: int) -> date_type:
+                    try:
+                        return d.replace(year=d.year + years)
+                    except ValueError:
+                        return d.replace(year=d.year + years, day=28)
+
+                two_years_from_offer = _add_years(offering_date, 2)
+                one_year_from_purchase = _add_years(purchase_date, 1)
+                if sale_date >= two_years_from_offer and sale_date >= one_year_from_purchase:
+                    disp_type = DispositionType.QUALIFYING
+                else:
+                    disp_type = DispositionType.DISQUALIFYING
+
+                espp_lines.append(ESPPIncomeLine(
+                    security=ticker,
+                    offering_date=offering_date,
+                    purchase_date=purchase_date,
+                    sale_date=sale_date,
+                    shares=Decimal(str(row["shares"])),
+                    purchase_price=purchase_price,
+                    fmv_at_purchase=fmv_at_purchase,
+                    fmv_at_offering=fmv_at_offering,
+                    sale_proceeds=proceeds,
+                    disposition_type=disp_type,
+                    ordinary_income=ordinary_income,
+                    adjusted_basis=correct_basis,
+                    capital_gain_loss=capital_gain_loss,
+                    holding_period=holding,
+                ))
+
+            gen_espp = ESPPReportGenerator()
+            content = gen_espp.render(espp_lines)
+            path = output / f"{year}_espp_income.txt"
+            path.write_text(content)
+            typer.echo(f"  [+] ESPP Income:       {path}")
+            reports_generated += 1
+        except Exception as exc:
+            typer.echo(f"  [!] ESPP Income failed: {exc}", err=True)
+    else:
+        typer.echo("  [-] ESPP Income:       skipped (no ESPP sales)")
+
+    # --- 4. AMT Worksheet ---
+    iso_events = repo.get_events(equity_type="ISO")
+    iso_exercises = [
+        ev for ev in iso_events if ev.get("event_type") == "EXERCISE"
+    ]
+    if iso_exercises:
+        try:
+            amt_lines: list[AMTWorksheetLine] = []
+            for ev in iso_exercises:
+                ticker = ev.get("ticker", "UNKNOWN")
+                shares = Decimal(str(ev["shares"]))
+                strike = Decimal(str(ev.get("strike_price", "0")))
+                fmv = Decimal(str(ev["price_per_share"]))
+                spread = fmv - strike
+                total_pref = spread * shares
+                grant_date = (
+                    date_type.fromisoformat(ev["grant_date"])
+                    if ev.get("grant_date")
+                    else date_type.fromisoformat(ev["event_date"])
+                )
+                exercise_date = date_type.fromisoformat(ev["event_date"])
+
+                amt_lines.append(AMTWorksheetLine(
+                    security=ticker,
+                    grant_date=grant_date,
+                    exercise_date=exercise_date,
+                    shares=shares,
+                    strike_price=strike,
+                    fmv_at_exercise=fmv,
+                    spread_per_share=spread,
+                    total_amt_preference=total_pref,
+                    regular_basis=strike * shares,
+                    amt_basis=fmv * shares,
+                ))
+
+            gen_amt = AMTWorksheetGenerator()
+            content = gen_amt.render(amt_lines)
+            path = output / f"{year}_amt_worksheet.txt"
+            path.write_text(content)
+            typer.echo(f"  [+] AMT Worksheet:     {path}")
+            reports_generated += 1
+        except Exception as exc:
+            typer.echo(f"  [!] AMT Worksheet failed: {exc}", err=True)
+    else:
+        typer.echo("  [-] AMT Worksheet:     skipped (no ISO exercises)")
+
+    # --- 5. Strategy Report ---
+    try:
+        engine = StrategyEngine()
+        user_inputs = UserInputs()
+        strategy_report = engine.analyze(
+            repo=repo,
+            tax_year=year,
+            filing_status=fs,
+            user_inputs=user_inputs,
+        )
+        if strategy_report.recommendations:
+            gen_strategy = StrategyReportGenerator()
+            content = gen_strategy.render(strategy_report.recommendations)
+            path = output / f"{year}_strategy.txt"
+            path.write_text(content)
+            typer.echo(f"  [+] Strategy:          {path}")
+            reports_generated += 1
+        else:
+            typer.echo("  [-] Strategy:          skipped (no recommendations)")
+    except Exception as exc:
+        typer.echo(f"  [!] Strategy failed: {exc}", err=True)
+
+    # --- 6. Tax Estimate Summary ---
+    try:
+        estimator = TaxEstimator()
+        estimate = estimator.estimate_from_db(
+            repo=repo,
+            tax_year=year,
+            filing_status=fs,
+        )
+        gen_summary = TaxSummaryGenerator()
+        content = gen_summary.render(estimate)
+        path = output / f"{year}_tax_summary.txt"
+        path.write_text(content)
+        typer.echo(f"  [+] Tax Summary:       {path}")
+        reports_generated += 1
+    except Exception as exc:
+        typer.echo(f"  [!] Tax Summary failed: {exc}", err=True)
+
+    conn.close()
+
+    typer.echo("")
+    typer.echo(f"Done. {reports_generated} report(s) generated in {output}/")
 
 
 @app.command()

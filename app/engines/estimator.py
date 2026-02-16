@@ -67,13 +67,48 @@ class TaxEstimator:
         us_treasury_interest: Decimal = Decimal("0"),
         medicare_wages: Decimal = Decimal("0"),
         medicare_tax_withheld: Decimal = Decimal("0"),
+        st_loss_carryover: Decimal = Decimal("0"),
+        lt_loss_carryover: Decimal = Decimal("0"),
+        prior_year_amt_credit: Decimal = Decimal("0"),
     ) -> TaxEstimate:
         """Compute full tax estimate.
 
         Capital loss netting should be done BEFORE calling this method.
         The short_term_gains and long_term_gains values passed here should
         already reflect the $3,000/$1,500 capital loss limitation.
+
+        Capital loss carryover (st_loss_carryover, lt_loss_carryover) is
+        applied here if provided — positive numbers representing prior-year
+        losses that offset current-year gains per IRC Section 1212(b).
         """
+        # --- Capital loss carryover (IRC Section 1212(b)) ---
+        st_co_applied = Decimal("0")
+        lt_co_applied = Decimal("0")
+        new_st_carryforward = Decimal("0")
+        new_lt_carryforward = Decimal("0")
+
+        if st_loss_carryover > Decimal("0") or lt_loss_carryover > Decimal("0"):
+            original_st = short_term_gains
+            original_lt = long_term_gains
+            short_term_gains, long_term_gains, new_st_carryforward, new_lt_carryforward = (
+                self.apply_capital_loss_carryover(
+                    short_term_gains, long_term_gains,
+                    st_loss_carryover, lt_loss_carryover,
+                    filing_status,
+                )
+            )
+            st_co_applied = original_st - short_term_gains
+            lt_co_applied = original_lt - long_term_gains
+            # The "applied" amount may include both direct offsets and
+            # character-crossing offsets. Report the total reduction.
+            total_applied = st_co_applied + lt_co_applied
+            if total_applied > Decimal("0"):
+                self.warnings.append(
+                    f"Applied capital loss carryover: "
+                    f"${st_loss_carryover:,.2f} ST + ${lt_loss_carryover:,.2f} LT. "
+                    f"Gains reduced by ${total_applied:,.2f}."
+                )
+
         # --- Income aggregation ---
         total_income = (
             w2_wages + interest_income + dividend_income
@@ -135,13 +170,21 @@ class TaxEstimator:
         federal_niit = self.compute_niit(investment_income, agi, filing_status)
 
         # --- AMT ---
-        federal_amt = self.compute_amt(
+        # SALT add-back: per Form 6251 Line 2a, the SALT deduction claimed on
+        # Schedule A must be added back for AMT purposes. This is an exclusion
+        # item (does NOT generate AMT credit).
+        salt_addback = Decimal("0")
+        if deduction_result is not None and deduction_result.federal_used_itemized:
+            salt_addback = deduction_result.federal_salt_deduction
+
+        federal_amt, amti, amt_exemption_used, amt_tmt = self.compute_amt(
             taxable_income=taxable_income,
             preferential_income=preferential_income,
             amt_preference=amt_iso_preference,
             regular_tax=federal_regular + federal_ltcg,
             filing_status=filing_status,
             tax_year=tax_year,
+            salt_addback=salt_addback,
         )
 
         # --- Foreign Tax Credit (IRC Section 901) ---
@@ -157,9 +200,22 @@ class TaxEstimator:
             )
         )
 
+        # --- AMT Credit (Form 8801) ---
+        amt_credit_used = Decimal("0")
+        amt_credit_carryforward = Decimal("0")
+        if prior_year_amt_credit > Decimal("0"):
+            from app.engines.iso_amt import ISOAMTEngine
+            iso_engine = ISOAMTEngine()
+            amt_credit_used, amt_credit_carryforward = iso_engine.compute_amt_credit(
+                prior_year_amt_credit=prior_year_amt_credit,
+                regular_tax=federal_regular + federal_ltcg,
+                tentative_minimum_tax=amt_tmt,
+            )
+
         # --- Federal totals ---
         federal_total = (
-            federal_pre_credit - federal_foreign_tax_credit + additional_medicare_tax
+            federal_pre_credit - federal_foreign_tax_credit
+            + additional_medicare_tax - amt_credit_used
         )
         effective_federal_withheld = federal_withheld + additional_medicare_credit
         federal_balance = (
@@ -203,10 +259,19 @@ class TaxEstimator:
             federal_niit=federal_niit,
             federal_amt=federal_amt,
             federal_foreign_tax_credit=federal_foreign_tax_credit,
+            st_loss_carryover_applied=st_co_applied,
+            lt_loss_carryover_applied=lt_co_applied,
+            st_loss_carryforward=new_st_carryforward,
+            lt_loss_carryforward=new_lt_carryforward,
             additional_medicare_tax=additional_medicare_tax,
             medicare_wages=medicare_wages,
             medicare_tax_withheld=medicare_tax_withheld,
             additional_medicare_withholding_credit=additional_medicare_credit,
+            amti=amti,
+            amt_exemption_used=amt_exemption_used,
+            amt_tentative_minimum_tax=amt_tmt,
+            amt_credit_used=amt_credit_used,
+            amt_credit_carryforward=amt_credit_carryforward,
             federal_total_tax=federal_total,
             federal_withheld=federal_withheld,
             federal_estimated_payments=federal_estimated_payments,
@@ -235,6 +300,9 @@ class TaxEstimator:
         itemized_detail: ItemizedDeductions | None = None,
         medicare_wages_override: Decimal | None = None,
         medicare_tax_withheld_override: Decimal | None = None,
+        st_loss_carryover: Decimal = Decimal("0"),
+        lt_loss_carryover: Decimal = Decimal("0"),
+        prior_year_amt_credit: Decimal = Decimal("0"),
     ) -> TaxEstimate:
         """Load data from the repository and compute a tax estimate.
 
@@ -263,6 +331,18 @@ class TaxEstimator:
                 medicare_wages += Decimal(str(w2["box5_medicare_wages"]))
             if w2.get("box6_medicare_withheld"):
                 medicare_tax_withheld += Decimal(str(w2["box6_medicare_withheld"]))
+
+        # --- Extract VPDI/SDI from W-2 Box 14 for SALT deduction ---
+        vpdi_total = Decimal("0")
+        for w2 in w2_records:
+            box14 = w2.get("box14_other")
+            if box14:
+                if isinstance(box14, str):
+                    import json
+                    box14 = json.loads(box14)
+                for key, value in box14.items():
+                    if key.upper() in ("VPDI", "CA VPDI", "SDI", "CA SDI"):
+                        vpdi_total += Decimal(str(value))
 
         # --- 1099-DIV aggregation ---
         div_records = repo.get_1099divs(tax_year)
@@ -393,6 +473,13 @@ class TaxEstimator:
         if medicare_tax_withheld_override is not None:
             medicare_tax_withheld = medicare_tax_withheld_override
 
+        # Add VPDI/SDI to state income tax for SALT deduction
+        if vpdi_total > Decimal("0") and itemized_detail is not None:
+            itemized_detail.state_income_tax_paid += vpdi_total
+            self.warnings.append(
+                f"Added ${vpdi_total:,.2f} CA VPDI/SDI (W-2 Box 14) to state income tax for SALT deduction."
+            )
+
         return self.estimate(
             tax_year=tax_year,
             filing_status=filing_status,
@@ -414,6 +501,9 @@ class TaxEstimator:
             us_treasury_interest=us_treasury_interest,
             medicare_wages=medicare_wages,
             medicare_tax_withheld=medicare_tax_withheld,
+            st_loss_carryover=st_loss_carryover,
+            lt_loss_carryover=lt_loss_carryover,
+            prior_year_amt_credit=prior_year_amt_credit,
         )
 
     # ------------------------------------------------------------------
@@ -551,6 +641,141 @@ class TaxEstimator:
         )
 
     # ------------------------------------------------------------------
+    # Capital loss carryover (IRC Section 1212(b))
+    # ------------------------------------------------------------------
+
+    def apply_capital_loss_carryover(
+        self,
+        short_term_gains: Decimal,
+        long_term_gains: Decimal,
+        st_loss_carryover: Decimal,
+        lt_loss_carryover: Decimal,
+        filing_status: FilingStatus,
+    ) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+        """Apply capital loss carryover per IRC Section 1212(b) and Schedule D.
+
+        Netting order per Schedule D Capital Loss Carryover Worksheet:
+        1. ST carryover offsets ST gains first, then LT gains
+        2. LT carryover offsets LT gains first, then ST gains
+        3. Net capital loss limited to $3,000/year ($1,500 MFS)
+        4. Excess carries forward retaining character
+
+        Args:
+            short_term_gains: Current year net ST gains (can be negative).
+            long_term_gains: Current year net LT gains (can be negative).
+            st_loss_carryover: Prior year ST loss carryover (positive number
+                representing a loss).
+            lt_loss_carryover: Prior year LT loss carryover (positive number
+                representing a loss).
+            filing_status: For the $3,000/$1,500 annual loss limit.
+
+        Returns:
+            (adjusted_st_gains, adjusted_lt_gains,
+             new_st_carryforward, new_lt_carryforward)
+        """
+        # Start with current gains
+        adj_st = short_term_gains
+        adj_lt = long_term_gains
+
+        # Track how much carryover was actually consumed
+        st_co_remaining = st_loss_carryover
+        lt_co_remaining = lt_loss_carryover
+
+        # Step 1: Apply ST carryover — offsets ST gains first, then LT gains
+        if st_co_remaining > Decimal("0"):
+            # Offset ST gains
+            st_offset = min(st_co_remaining, max(adj_st, Decimal("0")))
+            adj_st -= st_offset
+            st_co_remaining -= st_offset
+
+            # Any remaining ST carryover offsets LT gains
+            if st_co_remaining > Decimal("0"):
+                lt_offset = min(st_co_remaining, max(adj_lt, Decimal("0")))
+                adj_lt -= lt_offset
+                st_co_remaining -= lt_offset
+
+        # Step 2: Apply LT carryover — offsets LT gains first, then ST gains
+        if lt_co_remaining > Decimal("0"):
+            # Offset LT gains
+            lt_offset = min(lt_co_remaining, max(adj_lt, Decimal("0")))
+            adj_lt -= lt_offset
+            lt_co_remaining -= lt_offset
+
+            # Any remaining LT carryover offsets ST gains
+            if lt_co_remaining > Decimal("0"):
+                st_offset = min(lt_co_remaining, max(adj_st, Decimal("0")))
+                adj_st -= st_offset
+                lt_co_remaining -= st_offset
+
+        # Step 3: If carryover still remains (gains were insufficient),
+        # the excess adds to current-year losses, retaining character
+        if st_co_remaining > Decimal("0"):
+            adj_st -= st_co_remaining
+        if lt_co_remaining > Decimal("0"):
+            adj_lt -= lt_co_remaining
+
+        # Step 4: Apply annual loss limit and compute new carryforward
+        net_capital = adj_st + adj_lt
+        loss_limit = CAPITAL_LOSS_LIMIT.get(filing_status, Decimal("3000"))
+
+        new_st_carryforward = Decimal("0")
+        new_lt_carryforward = Decimal("0")
+
+        if net_capital < -loss_limit:
+            # Net loss exceeds annual limit; must cap and carry forward
+            # The deductible loss is limited to $3,000 (or $1,500 MFS)
+            # Excess carries forward retaining character per IRC 1212(b)(1)
+
+            # Determine how much of the excess is ST vs LT
+            # Per Schedule D Capital Loss Carryover Worksheet:
+            # ST carryforward = excess ST loss beyond what was used
+            # LT carryforward = excess LT loss beyond what was used
+            st_loss = max(-adj_st, Decimal("0"))
+            lt_loss = max(-adj_lt, Decimal("0"))
+            total_loss = st_loss + lt_loss
+
+            if total_loss > Decimal("0"):
+                # Distribute the deductible loss proportionally, then
+                # carryforward is whatever is left.
+                # Actually per Schedule D worksheet, the $3K deduction
+                # comes from ST losses first, then LT losses.
+                # ST losses absorb up to $3K first.
+                st_deduction = min(st_loss, loss_limit)
+                remaining_limit = loss_limit - st_deduction
+                lt_deduction = min(lt_loss, remaining_limit)
+
+                new_st_carryforward = st_loss - st_deduction
+                new_lt_carryforward = lt_loss - lt_deduction
+
+            # Adjust the reported gains to reflect the capped deduction
+            # Redistribute: the deductible amount = $3K (or $1.5K)
+            # ST gets its portion, LT gets its portion
+            if adj_st < Decimal("0") and adj_lt < Decimal("0"):
+                # Both negative: ST absorbs up to the limit first
+                adj_st = max(adj_st, -loss_limit)
+                remaining = loss_limit + adj_st  # positive remaining limit
+                if remaining > Decimal("0"):
+                    adj_lt = max(adj_lt, -remaining)
+                else:
+                    adj_lt = Decimal("0")
+            elif adj_st < Decimal("0"):
+                # Only ST is negative; it absorbed LT gains and is still negative
+                adj_st = max(adj_st, -loss_limit)
+            elif adj_lt < Decimal("0"):
+                # Only LT is negative; it absorbed ST gains and is still negative
+                adj_lt = max(adj_lt, -loss_limit)
+
+            if new_st_carryforward > Decimal("0") or new_lt_carryforward > Decimal("0"):
+                self.warnings.append(
+                    f"Capital loss carryforward to next year: "
+                    f"${new_st_carryforward:,.2f} ST + "
+                    f"${new_lt_carryforward:,.2f} LT = "
+                    f"${new_st_carryforward + new_lt_carryforward:,.2f} total."
+                )
+
+        return adj_st, adj_lt, new_st_carryforward, new_lt_carryforward
+
+    # ------------------------------------------------------------------
     # Tax computation methods
     # ------------------------------------------------------------------
 
@@ -664,25 +889,34 @@ class TaxEstimator:
         regular_tax: Decimal,
         filing_status: FilingStatus,
         tax_year: int,
-    ) -> Decimal:
+        salt_addback: Decimal = Decimal("0"),
+    ) -> tuple[Decimal, Decimal, Decimal, Decimal]:
         """Compute Alternative Minimum Tax per Form 6251.
 
         Args:
             taxable_income: Regular taxable income (Form 1040, Line 15).
             preferential_income: Qualified dividends + net LTCG.
-            amt_preference: Net AMT preference items (ISO exercises).
+            amt_preference: Net AMT preference items (ISO exercises — deferral items).
             regular_tax: Regular federal tax (ordinary + LTCG rates).
             filing_status: Filing status.
             tax_year: Tax year.
+            salt_addback: SALT deduction add-back per Form 6251 Line 2a
+                (exclusion item — does NOT generate AMT credit).
 
         Returns:
-            Federal AMT amount (zero if no AMT owed).
+            (amt, amti, amt_exemption_used, tentative_minimum_tax)
+            amt: Federal AMT amount (zero if no AMT owed).
+            amti: Alternative Minimum Taxable Income.
+            amt_exemption_used: AMT exemption after phase-out.
+            tentative_minimum_tax: TMT before comparing to regular tax.
         """
-        if amt_preference == Decimal("0"):
-            return Decimal("0")
+        # Step 1: AMTI — includes both deferral items (ISO) and
+        # exclusion items (SALT add-back)
+        amti = taxable_income + amt_preference + salt_addback
 
-        # Step 1: AMTI
-        amti = taxable_income + amt_preference
+        # No AMT additions at all — skip computation
+        if amt_preference == Decimal("0") and salt_addback == Decimal("0"):
+            return Decimal("0"), amti, Decimal("0"), Decimal("0")
 
         # Step 2: Exemption with phase-out
         exemption_data = AMT_EXEMPTION.get(tax_year, {})
@@ -692,7 +926,7 @@ class TaxEstimator:
                 f"No AMT exemption data for {tax_year}/{filing_status}. "
                 f"AMT computation skipped."
             )
-            return Decimal("0")
+            return Decimal("0"), amti, Decimal("0"), Decimal("0")
 
         exemption_amount = exemption_data[filing_status]
         phaseout_start = phaseout_data[filing_status]
@@ -705,12 +939,16 @@ class TaxEstimator:
         amt_base = max(amti - amt_exemption, Decimal("0"))
 
         if amt_base == Decimal("0"):
-            return Decimal("0")
+            return Decimal("0"), amti, amt_exemption, Decimal("0")
 
         # Step 4: Compute tentative minimum tax
         # Preferential income still gets LTCG rates under AMT
         amt_ordinary_base = max(amt_base - preferential_income, Decimal("0"))
         breakpoint = AMT_28_PERCENT_THRESHOLD.get(tax_year, Decimal("232600"))
+
+        # MFS filers use half the 28% threshold per IRC Section 55(b)(1)(A)(i)
+        if filing_status == FilingStatus.MFS:
+            breakpoint = breakpoint / 2
 
         if amt_ordinary_base <= breakpoint:
             amt_on_ordinary = amt_ordinary_base * Decimal("0.26")
@@ -728,7 +966,7 @@ class TaxEstimator:
 
         # Step 5: AMT = excess over regular tax
         amt = max(tentative_minimum_tax - regular_tax, Decimal("0"))
-        return amt
+        return amt, amti, amt_exemption, tentative_minimum_tax
 
     def compute_california_tax(
         self, taxable_income: Decimal, filing_status: FilingStatus, tax_year: int

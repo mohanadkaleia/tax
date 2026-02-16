@@ -98,11 +98,23 @@ class TaxEstimate(BaseModel):
     federal_niit: Decimal
     federal_amt: Decimal
     federal_foreign_tax_credit: Decimal = Decimal("0")
+    # Capital loss carryover (IRC Section 1212(b))
+    st_loss_carryover_applied: Decimal = Decimal("0")
+    lt_loss_carryover_applied: Decimal = Decimal("0")
+    st_loss_carryforward: Decimal = Decimal("0")
+    lt_loss_carryforward: Decimal = Decimal("0")
     # Additional Medicare Tax (Form 8959)
     additional_medicare_tax: Decimal = Decimal("0")
     medicare_wages: Decimal = Decimal("0")
     medicare_tax_withheld: Decimal = Decimal("0")
     additional_medicare_withholding_credit: Decimal = Decimal("0")
+    # AMT details (Form 6251)
+    amti: Decimal = Decimal("0")
+    amt_exemption_used: Decimal = Decimal("0")
+    amt_tentative_minimum_tax: Decimal = Decimal("0")
+    # AMT credit (Form 8801)
+    amt_credit_used: Decimal = Decimal("0")
+    amt_credit_carryforward: Decimal = Decimal("0")
     federal_total_tax: Decimal
     federal_withheld: Decimal
     federal_estimated_payments: Decimal = Decimal("0")

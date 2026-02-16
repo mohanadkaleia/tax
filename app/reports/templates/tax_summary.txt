@@ -1,0 +1,77 @@
+================================================================================
+              Tax Estimate Summary — {{ est.tax_year }} ({{ est.filing_status.value }})
+================================================================================
+
+INCOME
+  W-2 Wages:             ${{ "%.2f"|format(est.w2_wages) }}
+  Interest Income:       ${{ "%.2f"|format(est.interest_income) }}
+  Dividend Income:       ${{ "%.2f"|format(est.dividend_income) }}
+    (Qualified:          ${{ "%.2f"|format(est.qualified_dividends) }})
+  Short-Term Gains:      ${{ "%.2f"|format(est.short_term_gains) }}
+  Long-Term Gains:       ${{ "%.2f"|format(est.long_term_gains) }}
+  ──────────────────────────────────────
+  Total Income:          ${{ "%.2f"|format(est.total_income) }}
+  AGI:                   ${{ "%.2f"|format(est.agi) }}
+{% if est.st_loss_carryover_applied > 0 or est.lt_loss_carryover_applied > 0 or est.st_loss_carryforward > 0 or est.lt_loss_carryforward > 0 %}
+
+CAPITAL LOSS CARRYOVER
+{% if est.st_loss_carryover_applied > 0 %}  ST Carryover Applied:  ${{ "%.2f"|format(est.st_loss_carryover_applied) }}
+{% endif %}{% if est.lt_loss_carryover_applied > 0 %}  LT Carryover Applied:  ${{ "%.2f"|format(est.lt_loss_carryover_applied) }}
+{% endif %}  ──────────────────────────────────────
+{% if est.st_loss_carryforward > 0 %}  New ST Carryforward:   ${{ "%.2f"|format(est.st_loss_carryforward) }}
+{% endif %}{% if est.lt_loss_carryforward > 0 %}  New LT Carryforward:   ${{ "%.2f"|format(est.lt_loss_carryforward) }}
+{% endif %}{% endif %}
+
+DEDUCTIONS
+{% if est.itemized_detail %}{% if est.itemized_detail.federal_medical_deduction > 0 %}  Medical (after 7.5%):  ${{ "%.2f"|format(est.itemized_detail.federal_medical_deduction) }}
+{% endif %}  SALT (uncapped):       ${{ "%.2f"|format(est.itemized_detail.federal_salt_uncapped) }}
+  SALT (after cap):      ${{ "%.2f"|format(est.itemized_detail.federal_salt_deduction) }}
+{% if est.itemized_detail.federal_salt_cap_lost > 0 %}    *** ${{ "%.2f"|format(est.itemized_detail.federal_salt_cap_lost) }} lost to SALT cap
+{% endif %}{% if est.itemized_detail.federal_interest_deduction > 0 %}  Mortgage Interest:     ${{ "%.2f"|format(est.itemized_detail.federal_interest_deduction) }}
+{% endif %}  Charitable:            ${{ "%.2f"|format(est.itemized_detail.federal_charitable_deduction) }}
+  ──────────────────────────────────────
+  Federal Itemized:      ${{ "%.2f"|format(est.itemized_detail.federal_total_itemized) }}
+  Standard Deduction:    ${{ "%.2f"|format(est.itemized_detail.federal_standard_deduction) }}
+  >>> Using {{ "ITEMIZED" if est.itemized_detail.federal_used_itemized else "STANDARD" }}:      ${{ "%.2f"|format(est.itemized_detail.federal_deduction_used) }}
+
+  CA Itemized:           ${{ "%.2f"|format(est.itemized_detail.ca_total_itemized) }}
+  CA Standard:           ${{ "%.2f"|format(est.itemized_detail.ca_standard_deduction) }}
+  >>> CA Using {{ "ITEMIZED" if est.itemized_detail.ca_used_itemized else "STANDARD" }}: ${{ "%.2f"|format(est.itemized_detail.ca_deduction_used) }}
+{% else %}  Standard Deduction:    ${{ "%.2f"|format(est.standard_deduction) }}
+{% if est.itemized_deductions %}  Itemized Deductions:   ${{ "%.2f"|format(est.itemized_deductions) }}
+{% endif %}  Deduction Used:        ${{ "%.2f"|format(est.deduction_used) }}
+{% endif %}  Taxable Income:        ${{ "%.2f"|format(est.taxable_income) }}
+
+FEDERAL TAX
+  Ordinary Income Tax:   ${{ "%.2f"|format(est.federal_regular_tax) }}
+  LTCG/QDiv Tax:         ${{ "%.2f"|format(est.federal_ltcg_tax) }}
+  NIIT (3.8%):           ${{ "%.2f"|format(est.federal_niit) }}
+  AMT:                   ${{ "%.2f"|format(est.federal_amt) }}
+{% if est.additional_medicare_tax > 0 %}  Addl Medicare Tax:     ${{ "%.2f"|format(est.additional_medicare_tax) }}
+{% endif %}{% if est.amt_credit_used > 0 %}  AMT Credit (8801):    -${{ "%.2f"|format(est.amt_credit_used) }}
+{% endif %}  ──────────────────────────────────────
+  Total Federal Tax:     ${{ "%.2f"|format(est.federal_total_tax) }}
+  Federal Withheld:      ${{ "%.2f"|format(est.federal_withheld) }}
+{% if est.additional_medicare_withholding_credit > 0 %}  Addl Medicare Credit:  ${{ "%.2f"|format(est.additional_medicare_withholding_credit) }}
+{% endif %}{% if est.federal_estimated_payments > 0 %}  Est. Payments:         ${{ "%.2f"|format(est.federal_estimated_payments) }}
+{% endif %}  Federal Balance Due:   ${{ "%.2f"|format(est.federal_balance_due) }}
+{% if est.amt_credit_carryforward > 0 %}  AMT Credit Carryforward: ${{ "%.2f"|format(est.amt_credit_carryforward) }}
+{% endif %}
+
+CALIFORNIA TAX
+  CA Taxable Income:     ${{ "%.2f"|format(est.ca_taxable_income) }}
+  CA Income Tax:         ${{ "%.2f"|format(est.ca_tax) }}
+  Mental Health Tax:     ${{ "%.2f"|format(est.ca_mental_health_tax) }}
+  ──────────────────────────────────────
+  Total CA Tax:          ${{ "%.2f"|format(est.ca_total_tax) }}
+  CA Withheld:           ${{ "%.2f"|format(est.ca_withheld) }}
+{% if est.ca_estimated_payments > 0 %}  Est. Payments:         ${{ "%.2f"|format(est.ca_estimated_payments) }}
+{% endif %}  CA Balance Due:        ${{ "%.2f"|format(est.ca_balance_due) }}
+
+TOTAL
+  Total Tax:             ${{ "%.2f"|format(est.total_tax) }}
+  Total Withheld:        ${{ "%.2f"|format(est.total_withheld) }}
+  ══════════════════════════════════════
+{% if est.total_balance_due > 0 %}  BALANCE DUE:           ${{ "%.2f"|format(est.total_balance_due) }}
+{% else %}  REFUND:                ${{ "%.2f"|format(est.total_balance_due|abs) }}
+{% endif %}
