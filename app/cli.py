@@ -48,8 +48,8 @@ def main(ctx: typer.Context) -> None:
 
 @app.command()
 def import_data(
-    source: str = typer.Argument(..., help="Data source: manual, shareworks (robinhood coming soon)"),
-    file: Path = typer.Argument(..., help="Path to data file (JSON for manual, PDF for shareworks)"),
+    source: str = typer.Argument(..., help="Data source: manual, shareworks, robinhood"),
+    file: Path = typer.Argument(..., help="Path to data file (JSON for manual, PDF for shareworks, CSV for robinhood)"),
     year: int | None = typer.Option(
         None,
         "--year",
@@ -81,12 +81,12 @@ def import_data(
         if file.suffix.lower() != ".pdf":
             typer.echo(f"Error: Shareworks source expects a PDF file: {file}", err=True)
             raise typer.Exit(1)
+    elif source.lower() == "robinhood":
+        if file.suffix.lower() != ".csv":
+            typer.echo(f"Error: Robinhood source expects a CSV file: {file}", err=True)
+            raise typer.Exit(1)
     elif file.suffix.lower() != ".json":
         typer.echo(f"Error: File must be JSON: {file}", err=True)
-        raise typer.Exit(1)
-
-    if source.lower() == "robinhood":
-        typer.echo(f"Error: '{source}' adapter not yet implemented.", err=True)
         raise typer.Exit(1)
 
     from app.db.repository import TaxRepository
@@ -97,6 +97,9 @@ def import_data(
     if source.lower() == "shareworks":
         from app.ingestion.shareworks import ShareworksAdapter
         adapter = ShareworksAdapter()
+    elif source.lower() == "robinhood":
+        from app.ingestion.robinhood import RobinhoodAdapter
+        adapter = RobinhoodAdapter()
     else:
         from app.ingestion.manual import ManualAdapter
         adapter = ManualAdapter()

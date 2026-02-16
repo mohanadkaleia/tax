@@ -387,6 +387,38 @@ class TaxRepository:
         )
         self.conn.commit()
 
+    def reset_lot_shares(self) -> None:
+        """Reset all lot shares_remaining back to original shares.
+
+        Called before re-reconciliation to restore lots to their
+        pre-allocation state.
+        """
+        self.conn.execute("UPDATE lots SET shares_remaining = shares")
+        self.conn.commit()
+
+    def delete_auto_created_lots(self) -> int:
+        """Delete lots that were auto-created during reconciliation.
+
+        Auto-created lots have notes starting with 'Auto-created'.
+        Also cleans up their associated equity events (orphan events
+        whose id no longer appears as a source_event_id in any lot).
+
+        Returns the number of lots deleted.
+        """
+        # Delete auto-created lots
+        cursor = self.conn.execute(
+            "DELETE FROM lots WHERE notes LIKE 'Auto-created%'"
+        )
+        deleted = cursor.rowcount
+
+        # Clean up orphan events (events with no referencing lot)
+        self.conn.execute(
+            "DELETE FROM equity_events WHERE id NOT IN "
+            "(SELECT source_event_id FROM lots WHERE source_event_id IS NOT NULL)"
+        )
+        self.conn.commit()
+        return deleted
+
     # --- Audit log ---
 
     def save_audit_entry(self, entry: AuditEntry) -> None:

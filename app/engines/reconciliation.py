@@ -53,6 +53,8 @@ class ReconciliationEngine:
 
         # 1. Clear previous results for idempotent re-runs
         self.repo.clear_sale_results(tax_year)
+        self.repo.delete_auto_created_lots()
+        self.repo.reset_lot_shares()
 
         # 2. Load data
         sales = self._load_sales(tax_year)
@@ -121,11 +123,22 @@ class ReconciliationEngine:
         if not matching_lots:
             matching_lots = self.lot_matcher.match_fuzzy(lots, sale)
 
+        # ESPP/ISO priority matching: before the generic RSU flow, check if
+        # this sale's date_acquired matches an ESPP or ISO lot.  ESPP and ISO
+        # sales require special basis correction (ordinary income, AMT
+        # preference) that the generic auto-create/RSU path cannot provide.
+        if isinstance(sale.date_acquired, date) and matching_lots:
+            espp_iso_result = self._try_espp_iso_match(
+                sale, matching_lots, events
+            )
+            if espp_iso_result is not None:
+                return espp_iso_result
+
         if not matching_lots:
             # No lots found — try auto-creating a lot from 1099-B data.
             # This handles RSU sales where no lot was imported (e.g. pre-IPO vests,
             # or dates outside the Shareworks PDF range).
-            auto_lot = self._auto_create_lot(sale)
+            auto_lot = self._auto_create_lot(sale, existing_lots=lots)
             if auto_lot:
                 lots.append(auto_lot)
                 matching_lots = [auto_lot]
@@ -144,7 +157,7 @@ class ReconciliationEngine:
                 # the sale's date_acquired). Try auto-creating a lot from
                 # 1099-B data — this handles pre-IPO vests, dates outside
                 # the Shareworks PDF range, etc.
-                auto_lot = self._auto_create_lot(sale)
+                auto_lot = self._auto_create_lot(sale, existing_lots=matching_lots)
                 if auto_lot:
                     lots.append(auto_lot)
                     matching_lots = [auto_lot]
@@ -228,6 +241,177 @@ class ReconciliationEngine:
             self.repo.update_lot_shares_remaining(lot.id, lot.shares_remaining)
 
         return results
+
+    def _try_espp_iso_match(
+        self, sale: Sale, matching_lots: list[Lot], events: list[dict]
+    ) -> list[SaleResult] | None:
+        """Try to match a sale to an ESPP or ISO lot before the generic RSU flow.
+
+        ESPP and ISO sales require special basis correction (ordinary income,
+        AMT preference).  If we can identify the sale as ESPP/ISO by matching
+        its date_acquired to an ESPP/ISO lot, we should prioritize that lot
+        over any RSU lots for the same date.
+
+        Returns list of SaleResult if matched, None to fall through to generic flow.
+        """
+        if not isinstance(sale.date_acquired, date):
+            return None
+
+        # Find ESPP/ISO lots matching this sale's date_acquired
+        priority_lots = [
+            lot for lot in matching_lots
+            if lot.equity_type in (EquityType.ESPP, EquityType.ISO)
+            and lot.acquisition_date == sale.date_acquired
+            and lot.shares_remaining > 0
+        ]
+
+        if not priority_lots:
+            return None
+
+        # For each candidate lot, try to infer shares using event data
+        for lot in priority_lots:
+            event = self._find_source_event(lot, events)
+            if not event:
+                continue
+
+            if lot.equity_type == EquityType.ESPP:
+                result = self._try_espp_lot_match(sale, lot, event, events)
+                if result is not None:
+                    return result
+            elif lot.equity_type == EquityType.ISO:
+                result = self._try_iso_lot_match(sale, lot, event, events)
+                if result is not None:
+                    return result
+
+        return None  # Fall through to generic flow
+
+    def _try_espp_lot_match(
+        self, sale: Sale, lot: Lot, event: dict, events: list[dict]
+    ) -> list[SaleResult] | None:
+        """Try to match a sale to a specific ESPP lot using event data.
+
+        For ESPP sales, the broker typically reports FMV at purchase date as
+        the cost basis on 1099-B.  We use FMV (event.price_per_share) to infer
+        shares when shares=0 (manual 1099-B import).
+
+        Returns list of SaleResult on success, None on failure.
+        """
+        fmv_at_purchase = Decimal(event["price_per_share"])
+        if fmv_at_purchase <= 0:
+            return None
+
+        inferred_shares = self._infer_equity_shares(
+            sale, fmv_at_purchase, lot.shares_remaining
+        )
+        if inferred_shares is None:
+            return None
+
+        return self._build_priority_match_result(
+            sale, lot, inferred_shares, "ESPP", events
+        )
+
+    def _try_iso_lot_match(
+        self, sale: Sale, lot: Lot, event: dict, events: list[dict]
+    ) -> list[SaleResult] | None:
+        """Try to match a sale to a specific ISO lot using event data.
+
+        For ISO sales, the broker typically reports the strike (exercise) price
+        as the cost basis on 1099-B.  We use lot.cost_per_share (strike price)
+        to infer shares when shares=0 (manual 1099-B import).
+
+        Returns list of SaleResult on success, None on failure.
+        """
+        strike = lot.cost_per_share
+        if strike <= 0:
+            return None
+
+        inferred_shares = self._infer_equity_shares(
+            sale, strike, lot.shares_remaining
+        )
+        if inferred_shares is None:
+            return None
+
+        return self._build_priority_match_result(
+            sale, lot, inferred_shares, "ISO", events
+        )
+
+    def _infer_equity_shares(
+        self,
+        sale: Sale,
+        reference_price: Decimal,
+        max_shares: Decimal,
+    ) -> int | None:
+        """Infer share count for a sale using a reference price.
+
+        When a 1099-B import has shares=0, we infer the share count by
+        dividing broker_reported_basis by the reference price (FMV for ESPP,
+        strike price for ISO).
+
+        Returns inferred share count, or None if inference fails.
+        """
+        if sale.shares > 0:
+            inferred = int(sale.shares)
+        elif sale.broker_reported_basis and sale.broker_reported_basis > 0:
+            inferred = int(round(sale.broker_reported_basis / reference_price))
+        else:
+            # Can't infer shares -- use lot's total remaining
+            inferred = int(max_shares)
+
+        if inferred <= 0:
+            return None
+        if inferred > int(max_shares):
+            # More shares than lot has -- could be partial lot match;
+            # cap at lot's remaining shares.
+            inferred = int(max_shares)
+
+        return inferred
+
+    def _build_priority_match_result(
+        self,
+        sale: Sale,
+        lot: Lot,
+        inferred_shares: int,
+        equity_label: str,
+        events: list[dict],
+    ) -> list[SaleResult] | None:
+        """Build a SaleResult by matching a sale to a priority ESPP/ISO lot.
+
+        Creates a sub-sale with the inferred share count and correct per-share
+        proceeds, then runs basis correction via _correct_basis().
+
+        Returns list of SaleResult on success, None on failure.
+        """
+        # For 1099-B imports, proceeds_per_share holds total proceeds
+        total_proceeds = (
+            sale.proceeds_per_share if sale.shares == 0 else sale.total_proceeds
+        )
+        per_share_proceeds = total_proceeds / Decimal(str(inferred_shares))
+
+        sub_sale = Sale(
+            id=sale.id,
+            lot_id=lot.id,
+            security=sale.security,
+            date_acquired=sale.date_acquired,
+            sale_date=sale.sale_date,
+            shares=Decimal(str(inferred_shares)),
+            proceeds_per_share=per_share_proceeds,
+            broker_reported_basis=sale.broker_reported_basis,
+            basis_reported_to_irs=sale.basis_reported_to_irs,
+            broker_source=sale.broker_source,
+        )
+
+        try:
+            result = self._correct_basis(lot, sub_sale, events)
+            self.repo.save_sale_result(result)
+            lot.shares_remaining -= Decimal(str(inferred_shares))
+            self.repo.update_lot_shares_remaining(lot.id, lot.shares_remaining)
+            return [result]
+        except Exception as exc:
+            self.errors.append(
+                f"{equity_label} basis correction failed for sale {sale.id} "
+                f"(lot {lot.id}): {exc}"
+            )
+            return None
 
     def _correct_basis(
         self, lot: Lot, sale: Sale, events: list[dict]
@@ -362,7 +546,7 @@ class ReconciliationEngine:
 
         return [result]
 
-    def _auto_create_lot(self, sale: Sale) -> Lot | None:
+    def _auto_create_lot(self, sale: Sale, existing_lots: list[Lot] | None = None) -> Lot | None:
         """Auto-create an RSU lot from 1099-B sale data when no lot exists.
 
         When the 1099-B provides date_acquired and broker_reported_basis but
@@ -384,6 +568,25 @@ class ReconciliationEngine:
             return None
         if any(kw in sale_desc for kw in ("ISO", "INCENTIVE STOCK OPTION")):
             return None
+
+        # Don't auto-create RSU lots when ESPP/ISO lots exist for the same
+        # ticker + date.  The sale likely belongs to the ESPP/ISO lot but
+        # _try_espp_iso_match() could not infer shares (bad data, etc.).
+        # Auto-creating an RSU lot would mask the ESPP/ISO sale and suppress
+        # ordinary income computation.
+        if existing_lots and isinstance(sale.date_acquired, date):
+            has_espp_iso = any(
+                lot for lot in existing_lots
+                if lot.equity_type in (EquityType.ESPP, EquityType.ISO)
+                and lot.acquisition_date == sale.date_acquired
+            )
+            if has_espp_iso:
+                self.warnings.append(
+                    f"Sale {sale.id}: date {sale.date_acquired.isoformat()} "
+                    f"matches an ESPP/ISO lot but shares could not be "
+                    f"determined. Review manually — not auto-creating RSU lot."
+                )
+                return None
 
         # Determine shares and cost_per_share
         if sale.shares > 0:

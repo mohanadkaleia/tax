@@ -13,6 +13,7 @@ class FormType(StrEnum):
     FORM_3921 = "3921"
     FORM_3922 = "3922"
     SHAREWORKS_SUPPLEMENTAL = "shareworks_supplemental"
+    ROBINHOOD_CONSOLIDATED = "robinhood_consolidated"
     EQUITY_LOTS = "equity_lots"
 
 
