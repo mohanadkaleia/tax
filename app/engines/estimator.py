@@ -13,6 +13,8 @@ Implements:
 from decimal import Decimal
 
 from app.engines.brackets import (
+    ADDITIONAL_MEDICARE_TAX_RATE,
+    ADDITIONAL_MEDICARE_TAX_THRESHOLD,
     AMT_28_PERCENT_THRESHOLD,
     AMT_EXEMPTION,
     AMT_PHASEOUT_START,
@@ -21,12 +23,18 @@ from app.engines.brackets import (
     CALIFORNIA_BRACKETS,
     CALIFORNIA_STANDARD_DEDUCTION,
     CAPITAL_LOSS_LIMIT,
+    CHARITABLE_CASH_AGI_LIMIT,
+    CHARITABLE_PROPERTY_AGI_LIMIT,
     FEDERAL_BRACKETS,
     FEDERAL_LTCG_BRACKETS,
+    FEDERAL_SALT_CAP,
     FEDERAL_STANDARD_DEDUCTION,
+    MEDICAL_EXPENSE_AGI_FLOOR,
     NIIT_RATE,
     NIIT_THRESHOLD,
+    REGULAR_MEDICARE_TAX_RATE,
 )
+from app.models.deductions import ItemizedDeductionResult, ItemizedDeductions
 from app.models.enums import FilingStatus
 from app.models.reports import TaxEstimate
 
@@ -53,9 +61,12 @@ class TaxEstimator:
         federal_estimated_payments: Decimal = Decimal("0"),
         state_estimated_payments: Decimal = Decimal("0"),
         itemized_deductions: Decimal | None = None,
+        itemized_detail: ItemizedDeductions | None = None,
         section_199a_dividends: Decimal = Decimal("0"),
         foreign_tax_paid: Decimal = Decimal("0"),
         us_treasury_interest: Decimal = Decimal("0"),
+        medicare_wages: Decimal = Decimal("0"),
+        medicare_tax_withheld: Decimal = Decimal("0"),
     ) -> TaxEstimate:
         """Compute full tax estimate.
 
@@ -75,11 +86,28 @@ class TaxEstimator:
         # Available regardless of whether taxpayer itemizes.
         section_199a_deduction = section_199a_dividends * Decimal("0.20")
 
-        # --- Federal deductions ---
+        # --- Deductions (federal + CA computed separately) ---
         std_ded = FEDERAL_STANDARD_DEDUCTION.get(tax_year, {}).get(
             filing_status, Decimal("14600")
         )
-        deduction_used = max(itemized_deductions or Decimal("0"), std_ded)
+        ca_std_ded = CALIFORNIA_STANDARD_DEDUCTION.get(tax_year, {}).get(
+            filing_status, Decimal("5540")
+        )
+        deduction_result: ItemizedDeductionResult | None = None
+
+        if itemized_detail is not None:
+            deduction_result = self.compute_itemized_deductions(
+                itemized_detail, agi, filing_status, tax_year
+            )
+            deduction_used = deduction_result.federal_deduction_used
+            ca_deduction = deduction_result.ca_deduction_used
+        elif itemized_deductions is not None:
+            deduction_used = max(itemized_deductions, std_ded)
+            ca_deduction = max(itemized_deductions, ca_std_ded)
+        else:
+            deduction_used = std_ded
+            ca_deduction = ca_std_ded
+
         taxable_income = max(agi - deduction_used - section_199a_deduction, Decimal("0"))
 
         # --- Split ordinary vs. preferential income ---
@@ -122,18 +150,26 @@ class TaxEstimator:
         federal_pre_credit = federal_regular + federal_ltcg + federal_niit + federal_amt
         federal_foreign_tax_credit = min(foreign_tax_paid, federal_pre_credit)
 
+        # --- Additional Medicare Tax (Form 8959) ---
+        additional_medicare_tax, additional_medicare_credit = (
+            self.compute_additional_medicare_tax(
+                medicare_wages, medicare_tax_withheld, filing_status
+            )
+        )
+
         # --- Federal totals ---
-        federal_total = federal_pre_credit - federal_foreign_tax_credit
-        federal_balance = federal_total - federal_withheld - federal_estimated_payments
+        federal_total = (
+            federal_pre_credit - federal_foreign_tax_credit + additional_medicare_tax
+        )
+        effective_federal_withheld = federal_withheld + additional_medicare_credit
+        federal_balance = (
+            federal_total - effective_federal_withheld - federal_estimated_payments
+        )
 
         # --- California ---
         # US Treasury/savings bond interest is exempt from CA tax
         # per CA Revenue & Taxation Code Section 17144
         ca_treasury_exemption = us_treasury_interest
-        ca_std_ded = CALIFORNIA_STANDARD_DEDUCTION.get(tax_year, {}).get(
-            filing_status, Decimal("5540")
-        )
-        ca_deduction = max(itemized_deductions or Decimal("0"), ca_std_ded)
         ca_taxable = max(agi - ca_deduction - ca_treasury_exemption, Decimal("0"))
         ca_tax = self.compute_california_tax(ca_taxable, filing_status, tax_year)
         ca_mh = (
@@ -142,6 +178,8 @@ class TaxEstimator:
         )
         ca_total = ca_tax + ca_mh
         ca_balance = ca_total - state_withheld - state_estimated_payments
+
+        total_withheld = effective_federal_withheld + state_withheld
 
         return TaxEstimate(
             tax_year=tax_year,
@@ -157,6 +195,7 @@ class TaxEstimator:
             section_199a_deduction=section_199a_deduction,
             standard_deduction=std_ded,
             itemized_deductions=itemized_deductions,
+            itemized_detail=deduction_result,
             deduction_used=deduction_used,
             taxable_income=taxable_income,
             federal_regular_tax=federal_regular,
@@ -164,6 +203,10 @@ class TaxEstimator:
             federal_niit=federal_niit,
             federal_amt=federal_amt,
             federal_foreign_tax_credit=federal_foreign_tax_credit,
+            additional_medicare_tax=additional_medicare_tax,
+            medicare_wages=medicare_wages,
+            medicare_tax_withheld=medicare_tax_withheld,
+            additional_medicare_withholding_credit=additional_medicare_credit,
             federal_total_tax=federal_total,
             federal_withheld=federal_withheld,
             federal_estimated_payments=federal_estimated_payments,
@@ -177,7 +220,7 @@ class TaxEstimator:
             ca_estimated_payments=state_estimated_payments,
             ca_balance_due=ca_balance,
             total_tax=federal_total + ca_total,
-            total_withheld=federal_withheld + state_withheld,
+            total_withheld=total_withheld,
             total_balance_due=federal_balance + ca_balance,
         )
 
@@ -189,6 +232,9 @@ class TaxEstimator:
         federal_estimated_payments: Decimal = Decimal("0"),
         state_estimated_payments: Decimal = Decimal("0"),
         itemized_deductions: Decimal | None = None,
+        itemized_detail: ItemizedDeductions | None = None,
+        medicare_wages_override: Decimal | None = None,
+        medicare_tax_withheld_override: Decimal | None = None,
     ) -> TaxEstimate:
         """Load data from the repository and compute a tax estimate.
 
@@ -206,11 +252,17 @@ class TaxEstimator:
         w2_wages = Decimal("0")
         federal_withheld = Decimal("0")
         state_withheld = Decimal("0")
+        medicare_wages = Decimal("0")
+        medicare_tax_withheld = Decimal("0")
         for w2 in w2_records:
             w2_wages += Decimal(str(w2["box1_wages"]))
             federal_withheld += Decimal(str(w2["box2_federal_withheld"]))
             if w2.get("box17_state_withheld"):
                 state_withheld += Decimal(str(w2["box17_state_withheld"]))
+            if w2.get("box5_medicare_wages"):
+                medicare_wages += Decimal(str(w2["box5_medicare_wages"]))
+            if w2.get("box6_medicare_withheld"):
+                medicare_tax_withheld += Decimal(str(w2["box6_medicare_withheld"]))
 
         # --- 1099-DIV aggregation ---
         div_records = repo.get_1099divs(tax_year)
@@ -335,6 +387,12 @@ class TaxEstimator:
                 else:
                     long_term_gains = Decimal("0")
 
+        # Apply CLI overrides for Medicare wages/withholding if provided
+        if medicare_wages_override is not None:
+            medicare_wages = medicare_wages_override
+        if medicare_tax_withheld_override is not None:
+            medicare_tax_withheld = medicare_tax_withheld_override
+
         return self.estimate(
             tax_year=tax_year,
             filing_status=filing_status,
@@ -350,9 +408,146 @@ class TaxEstimator:
             federal_estimated_payments=federal_estimated_payments,
             state_estimated_payments=state_estimated_payments,
             itemized_deductions=itemized_deductions,
+            itemized_detail=itemized_detail,
             section_199a_dividends=section_199a_dividends,
             foreign_tax_paid=foreign_tax_paid,
             us_treasury_interest=us_treasury_interest,
+            medicare_wages=medicare_wages,
+            medicare_tax_withheld=medicare_tax_withheld,
+        )
+
+    # ------------------------------------------------------------------
+    # Itemized deduction computation
+    # ------------------------------------------------------------------
+
+    def compute_itemized_deductions(
+        self,
+        deductions: ItemizedDeductions,
+        agi: Decimal,
+        filing_status: FilingStatus,
+        tax_year: int,
+    ) -> ItemizedDeductionResult:
+        """Compute federal and CA itemized deductions with all limitations.
+
+        Federal applies SALT cap (IRC 164(b)(6)), medical 7.5% AGI floor
+        (IRC 213), and charitable 60% AGI limit (IRC 170(b)).
+        CA does not conform to the SALT cap and does not allow deduction
+        of CA income tax on the CA return (R&TC 17220).
+        """
+        # 1. Medical deduction (same for federal and CA)
+        medical_floor = agi * MEDICAL_EXPENSE_AGI_FLOOR
+        medical_deduction = max(deductions.medical_expenses - medical_floor, Decimal("0"))
+
+        # 2. Federal SALT (capped per IRC 164(b)(6))
+        uncapped_salt = (
+            deductions.state_income_tax_paid
+            + deductions.real_estate_taxes
+            + deductions.personal_property_taxes
+        )
+        salt_cap = FEDERAL_SALT_CAP.get(tax_year, {}).get(
+            filing_status, Decimal("10000")
+        )
+        federal_salt = min(uncapped_salt, salt_cap)
+        salt_cap_lost = uncapped_salt - federal_salt
+
+        if salt_cap_lost > Decimal("0"):
+            self.warnings.append(
+                f"SALT cap: ${uncapped_salt:,.2f} in state/local taxes exceeds "
+                f"the ${salt_cap:,.2f} federal limit. "
+                f"${salt_cap_lost:,.2f} is not deductible."
+            )
+
+        # 3. California SALT (no cap; CA income tax NOT deductible on CA per R&TC 17220)
+        ca_salt = deductions.real_estate_taxes + deductions.personal_property_taxes
+
+        # 4. Interest
+        federal_interest = (
+            deductions.mortgage_interest
+            + deductions.mortgage_points
+            + deductions.investment_interest
+        )
+        ca_interest = federal_interest
+
+        # 5. Charitable (60% AGI limit for cash; 30% for appreciated property)
+        total_charitable = (
+            deductions.charitable_cash
+            + deductions.charitable_noncash
+            + deductions.charitable_carryover
+        )
+        cash_limit = agi * CHARITABLE_CASH_AGI_LIMIT
+        property_limit = agi * CHARITABLE_PROPERTY_AGI_LIMIT
+        # Cash first, then noncash against the lower property limit
+        cash_allowed = min(deductions.charitable_cash + deductions.charitable_carryover, cash_limit)
+        noncash_remaining_limit = max(property_limit - max(cash_allowed - (agi * CHARITABLE_PROPERTY_AGI_LIMIT), Decimal("0")), Decimal("0"))
+        noncash_allowed = min(deductions.charitable_noncash, property_limit)
+        federal_charitable = min(cash_allowed + noncash_allowed, cash_limit)
+        charitable_limited = total_charitable - federal_charitable
+
+        if charitable_limited > Decimal("0"):
+            self.warnings.append(
+                f"Charitable contributions of ${total_charitable:,.2f} exceed "
+                f"AGI limits. ${charitable_limited:,.2f} carries forward 5 years."
+            )
+
+        ca_charitable = federal_charitable
+
+        # 6. Casualty + Other (pass-through)
+        federal_casualty = deductions.casualty_loss
+        federal_other = deductions.other_deductions
+
+        if deductions.casualty_loss > Decimal("0"):
+            self.warnings.append(
+                "Casualty loss claimed — verify it is from a "
+                "federally declared disaster (IRC 165(h), post-TCJA)."
+            )
+
+        # 7. Totals
+        federal_itemized = (
+            medical_deduction + federal_salt + federal_interest
+            + federal_charitable + federal_casualty + federal_other
+        )
+        ca_itemized = (
+            medical_deduction + ca_salt + ca_interest
+            + ca_charitable + federal_casualty + federal_other
+        )
+
+        # 8. Standard vs. itemized comparison (each jurisdiction independently)
+        fed_std = FEDERAL_STANDARD_DEDUCTION.get(tax_year, {}).get(
+            filing_status, Decimal("14600")
+        )
+        ca_std = CALIFORNIA_STANDARD_DEDUCTION.get(tax_year, {}).get(
+            filing_status, Decimal("5540")
+        )
+
+        fed_used = max(federal_itemized, fed_std)
+        fed_used_itemized = federal_itemized > fed_std
+        ca_used = max(ca_itemized, ca_std)
+        ca_used_itemized = ca_itemized > ca_std
+
+        return ItemizedDeductionResult(
+            federal_medical_deduction=medical_deduction,
+            federal_salt_uncapped=uncapped_salt,
+            federal_salt_deduction=federal_salt,
+            federal_salt_cap_lost=salt_cap_lost,
+            federal_interest_deduction=federal_interest,
+            federal_charitable_deduction=federal_charitable,
+            federal_charitable_limited=charitable_limited,
+            federal_casualty_loss=federal_casualty,
+            federal_other_deductions=federal_other,
+            federal_total_itemized=federal_itemized,
+            federal_standard_deduction=fed_std,
+            federal_deduction_used=fed_used,
+            federal_used_itemized=fed_used_itemized,
+            ca_medical_deduction=medical_deduction,
+            ca_salt_deduction=ca_salt,
+            ca_interest_deduction=ca_interest,
+            ca_charitable_deduction=ca_charitable,
+            ca_casualty_loss=federal_casualty,
+            ca_other_deductions=federal_other,
+            ca_total_itemized=ca_itemized,
+            ca_standard_deduction=ca_std,
+            ca_deduction_used=ca_used,
+            ca_used_itemized=ca_used_itemized,
         )
 
     # ------------------------------------------------------------------
@@ -430,6 +625,36 @@ class TaxEstimator:
         excess_agi = max(agi - threshold, Decimal("0"))
         niit_base = min(max(investment_income, Decimal("0")), excess_agi)
         return niit_base * NIIT_RATE
+
+    def compute_additional_medicare_tax(
+        self,
+        medicare_wages: Decimal,
+        medicare_tax_withheld: Decimal,
+        filing_status: FilingStatus,
+        self_employment_income: Decimal = Decimal("0"),
+    ) -> tuple[Decimal, Decimal]:
+        """Compute Additional Medicare Tax per Form 8959.
+
+        Returns:
+            (additional_tax, withholding_credit)
+            additional_tax: 0.9% on Medicare wages exceeding threshold
+            withholding_credit: excess Medicare withholding (Box 6 - 1.45% x Box 5)
+        """
+        threshold = ADDITIONAL_MEDICARE_TAX_THRESHOLD[filing_status]
+        excess_wages = max(medicare_wages - threshold, Decimal("0"))
+        additional_tax = (excess_wages * ADDITIONAL_MEDICARE_TAX_RATE).quantize(
+            Decimal("0.01")
+        )
+
+        # Withholding credit: Medicare withheld minus regular rate on all wages
+        regular_medicare = (medicare_wages * REGULAR_MEDICARE_TAX_RATE).quantize(
+            Decimal("0.01")
+        )
+        withholding_credit = max(
+            medicare_tax_withheld - regular_medicare, Decimal("0")
+        )
+
+        return additional_tax, withholding_credit
 
     def compute_amt(
         self,

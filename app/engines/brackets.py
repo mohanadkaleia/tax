@@ -184,6 +184,19 @@ AMT_28_PERCENT_THRESHOLD: dict[int, Decimal] = {
 }
 
 # ---------------------------------------------------------------------------
+# Additional Medicare Tax (IRC Section 3101(b)(2)) — 0.9% on wages exceeding threshold
+# Thresholds are NOT inflation-adjusted — statutory amounts.
+# ---------------------------------------------------------------------------
+ADDITIONAL_MEDICARE_TAX_RATE = Decimal("0.009")
+ADDITIONAL_MEDICARE_TAX_THRESHOLD: dict[FilingStatus, Decimal] = {
+    FilingStatus.SINGLE: Decimal("200000"),
+    FilingStatus.MFJ: Decimal("250000"),
+    FilingStatus.MFS: Decimal("125000"),
+    FilingStatus.HOH: Decimal("200000"),
+}
+REGULAR_MEDICARE_TAX_RATE = Decimal("0.0145")  # 1.45% regular rate
+
+# ---------------------------------------------------------------------------
 # Capital loss limitation per IRC Section 1211(b)
 # ---------------------------------------------------------------------------
 CAPITAL_LOSS_LIMIT: dict[FilingStatus, Decimal] = {
@@ -292,3 +305,32 @@ CALIFORNIA_STANDARD_DEDUCTION: dict[int, dict[FilingStatus, Decimal]] = {
 # ---------------------------------------------------------------------------
 CA_MENTAL_HEALTH_THRESHOLD = Decimal("1000000")
 CA_MENTAL_HEALTH_RATE = Decimal("0.01")
+
+# ---------------------------------------------------------------------------
+# SALT cap per IRC Section 164(b)(6) — TCJA 2018-2025
+# ---------------------------------------------------------------------------
+FEDERAL_SALT_CAP: dict[int, dict[FilingStatus, Decimal]] = {
+    2024: {
+        FilingStatus.SINGLE: Decimal("10000"),
+        FilingStatus.MFJ: Decimal("10000"),
+        FilingStatus.MFS: Decimal("5000"),
+        FilingStatus.HOH: Decimal("10000"),
+    },
+    2025: {
+        FilingStatus.SINGLE: Decimal("10000"),
+        FilingStatus.MFJ: Decimal("10000"),
+        FilingStatus.MFS: Decimal("5000"),
+        FilingStatus.HOH: Decimal("10000"),
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Charitable contribution AGI limits (IRC Section 170(b))
+# ---------------------------------------------------------------------------
+CHARITABLE_CASH_AGI_LIMIT = Decimal("0.60")  # 60% of AGI for cash to public charities
+CHARITABLE_PROPERTY_AGI_LIMIT = Decimal("0.30")  # 30% of AGI for appreciated property
+
+# ---------------------------------------------------------------------------
+# Medical expense AGI floor (IRC Section 213(a))
+# ---------------------------------------------------------------------------
+MEDICAL_EXPENSE_AGI_FLOOR = Decimal("0.075")  # 7.5% of AGI

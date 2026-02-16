@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel
 
+from app.models.deductions import ItemizedDeductionResult
 from app.models.enums import (
     AdjustmentCode,
     DispositionType,
@@ -88,6 +89,7 @@ class TaxEstimate(BaseModel):
     section_199a_deduction: Decimal = Decimal("0")
     standard_deduction: Decimal
     itemized_deductions: Decimal | None = None
+    itemized_detail: ItemizedDeductionResult | None = None
     deduction_used: Decimal
     taxable_income: Decimal
     # Federal
@@ -96,6 +98,11 @@ class TaxEstimate(BaseModel):
     federal_niit: Decimal
     federal_amt: Decimal
     federal_foreign_tax_credit: Decimal = Decimal("0")
+    # Additional Medicare Tax (Form 8959)
+    additional_medicare_tax: Decimal = Decimal("0")
+    medicare_wages: Decimal = Decimal("0")
+    medicare_tax_withheld: Decimal = Decimal("0")
+    additional_medicare_withholding_credit: Decimal = Decimal("0")
     federal_total_tax: Decimal
     federal_withheld: Decimal
     federal_estimated_payments: Decimal = Decimal("0")

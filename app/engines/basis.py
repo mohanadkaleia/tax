@@ -172,10 +172,18 @@ class BasisCorrectionEngine:
             actual_gain = proceeds - regular_basis
             ordinary_income = min(spread, max(actual_gain, Decimal("0")))
 
-        # AMT adjustment: difference between regular and AMT gain
-        regular_gain = proceeds - regular_basis
-        amt_gain = proceeds - amt_basis
-        amt_adjustment = regular_gain - amt_gain  # Negative = reversal of prior preference
+        # AMT adjustment per IRS Form 6251 Line 2i:
+        # - Same-year exercise + sale: no adjustment required (exercise preference
+        #   and sale reversal cancel within the same tax year).
+        # - Prior-year exercise, current-year sale: reverse the exercise-year
+        #   preference. Adjustment = AMT gain − regular gain (always negative).
+        same_year = form3921.exercise_date.year == sale.sale_date.year
+        if same_year:
+            amt_adjustment = Decimal("0")
+        else:
+            regular_gain = proceeds - regular_basis
+            amt_gain = proceeds - amt_basis
+            amt_adjustment = amt_gain - regular_gain  # Negative = reversal of prior-year preference
 
         disp_label = "DISQUALIFYING" if is_disqualifying else "QUALIFYING"
         return SaleResult(

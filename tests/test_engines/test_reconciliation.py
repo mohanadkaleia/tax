@@ -220,11 +220,11 @@ class TestReconcileISO:
         assert run["matched_sales"] == 1
         # Qualifying ISO: no ordinary income
         assert Decimal(run["total_ordinary_income"]) == Decimal("0")
-        # AMT adjustment = regular gain - AMT gain
+        # AMT adjustment = AMT gain − regular gain (negative reversal per Form 6251 Line 2i)
         # Regular: ($150-$50)*200 = $20,000
         # AMT: ($150-$120)*200 = $6,000
-        # Adjustment: $20,000 - $6,000 = $14,000
-        assert Decimal(run["total_amt_adjustment"]) == Decimal("14000.00")
+        # Adjustment: $6,000 - $20,000 = -$14,000
+        assert Decimal(run["total_amt_adjustment"]) == Decimal("-14000.00")
 
 
 class TestReconcileEdgeCases:

@@ -504,6 +504,7 @@ class TestArithmeticIdentities:
         )
         assert r.federal_total_tax == (
             r.federal_regular_tax + r.federal_ltcg_tax + r.federal_niit + r.federal_amt
+            + r.additional_medicare_tax - r.federal_foreign_tax_credit
         )
         assert r.ca_total_tax == r.ca_tax + r.ca_mental_health_tax
         assert r.total_tax == r.federal_total_tax + r.ca_total_tax

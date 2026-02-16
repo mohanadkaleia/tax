@@ -67,7 +67,8 @@ class TestISOQualifyingDisposition:
         AMT basis = $120 × 200 = $24,000.
         Proceeds = $150 × 200 = $30,000.
         Regular gain = $20,000, AMT gain = $6,000.
-        AMT adjustment = $20,000 - $6,000 = $14,000 (reversal of prior preference).
+        AMT adjustment = AMT gain − regular gain = $6,000 − $20,000 = −$14,000
+        (negative = reversal of prior-year exercise preference per Form 6251 Line 2i).
         No ordinary income for qualifying ISO disposition.
         """
         sale = Sale(
@@ -87,7 +88,7 @@ class TestISOQualifyingDisposition:
         assert result.correct_basis == Decimal("10000.00")
         assert result.proceeds == Decimal("30000.00")
         assert result.ordinary_income == Decimal("0")
-        assert result.amt_adjustment == Decimal("14000.00")
+        assert result.amt_adjustment == Decimal("-14000.00")
         assert result.adjustment_code == AdjustmentCode.B
         assert result.adjustment_amount == Decimal("10000.00")
         assert result.holding_period == HoldingPeriod.LONG_TERM

@@ -305,13 +305,56 @@ def estimate(
     itemized: float | None = typer.Option(
         None,
         "--itemized",
-        help="Total itemized deductions (omit to use standard deduction)",
+        help="[Legacy] Total itemized deductions as a single number",
+    ),
+    deductions_file: Path | None = typer.Option(
+        None,
+        "--deductions-file",
+        help="JSON file with itemized deduction details (Schedule A)",
+    ),
+    salt: float | None = typer.Option(
+        None,
+        "--salt",
+        help="State/local income tax paid (for SALT deduction)",
+    ),
+    charitable: float | None = typer.Option(
+        None,
+        "--charitable",
+        help="Charitable contributions (cash)",
+    ),
+    mortgage_interest: float | None = typer.Option(
+        None,
+        "--mortgage-interest",
+        help="Mortgage interest paid",
+    ),
+    medical: float | None = typer.Option(
+        None,
+        "--medical",
+        help="Unreimbursed medical/dental expenses",
+    ),
+    property_tax: float | None = typer.Option(
+        None,
+        "--property-tax",
+        help="Real estate property taxes paid",
+    ),
+    medicare_wages: float | None = typer.Option(
+        None,
+        "--medicare-wages",
+        help="Medicare wages (W-2 Box 5) — override auto-extraction from DB",
+    ),
+    medicare_withheld: float | None = typer.Option(
+        None,
+        "--medicare-withheld",
+        help="Medicare tax withheld (W-2 Box 6) — override auto-extraction from DB",
     ),
 ) -> None:
     """Compute estimated tax liability for a tax year."""
+    import json
+
     from app.db.repository import TaxRepository
     from app.db.schema import create_schema
     from app.engines.estimator import TaxEstimator
+    from app.models.deductions import ItemizedDeductions
     from app.models.enums import FilingStatus
 
     # Validate filing status
@@ -336,7 +379,28 @@ def estimate(
 
     fed_est = Decimal(str(federal_estimated))
     state_est = Decimal(str(state_estimated))
-    itemized_dec = Decimal(str(itemized)) if itemized is not None else None
+
+    # Build structured itemized deductions from CLI inputs
+    itemized_detail = None
+    itemized_dec = None
+
+    if deductions_file is not None:
+        data = json.loads(deductions_file.read_text())
+        itemized_detail = ItemizedDeductions(**data)
+    elif any(x is not None for x in [salt, charitable, mortgage_interest, medical, property_tax]):
+        itemized_detail = ItemizedDeductions(
+            state_income_tax_paid=Decimal(str(salt or 0)),
+            charitable_cash=Decimal(str(charitable or 0)),
+            mortgage_interest=Decimal(str(mortgage_interest or 0)),
+            medical_expenses=Decimal(str(medical or 0)),
+            real_estate_taxes=Decimal(str(property_tax or 0)),
+        )
+    elif itemized is not None:
+        itemized_dec = Decimal(str(itemized))
+
+    # Medicare overrides
+    mw_override = Decimal(str(medicare_wages)) if medicare_wages is not None else None
+    mwh_override = Decimal(str(medicare_withheld)) if medicare_withheld is not None else None
 
     typer.echo(f"Estimating tax for year {year} (filing status: {fs_key})...")
     result = engine.estimate_from_db(
@@ -346,6 +410,9 @@ def estimate(
         federal_estimated_payments=fed_est,
         state_estimated_payments=state_est,
         itemized_deductions=itemized_dec,
+        itemized_detail=itemized_detail,
+        medicare_wages_override=mw_override,
+        medicare_tax_withheld_override=mwh_override,
     )
     conn.close()
 
@@ -364,10 +431,34 @@ def estimate(
     typer.echo(f"  AGI:                   ${result.agi:>12,.2f}")
     typer.echo("")
     typer.echo("DEDUCTIONS")
-    typer.echo(f"  Standard Deduction:    ${result.standard_deduction:>12,.2f}")
-    if result.itemized_deductions:
-        typer.echo(f"  Itemized Deductions:   ${result.itemized_deductions:>12,.2f}")
-    typer.echo(f"  Deduction Used:        ${result.deduction_used:>12,.2f}")
+    detail = result.itemized_detail
+    if detail is not None:
+        if detail.federal_medical_deduction > 0:
+            typer.echo(f"  Medical (after 7.5%):  ${detail.federal_medical_deduction:>12,.2f}")
+        typer.echo(f"  SALT (uncapped):       ${detail.federal_salt_uncapped:>12,.2f}")
+        typer.echo(f"  SALT (after cap):      ${detail.federal_salt_deduction:>12,.2f}")
+        if detail.federal_salt_cap_lost > 0:
+            typer.echo(f"    *** ${detail.federal_salt_cap_lost:,.2f} lost to SALT cap")
+        if detail.federal_interest_deduction > 0:
+            typer.echo(f"  Mortgage Interest:     ${detail.federal_interest_deduction:>12,.2f}")
+        typer.echo(f"  Charitable:            ${detail.federal_charitable_deduction:>12,.2f}")
+        if detail.federal_casualty_loss > 0 or detail.federal_other_deductions > 0:
+            typer.echo(f"  Casualty/Other:        ${detail.federal_casualty_loss + detail.federal_other_deductions:>12,.2f}")
+        typer.echo("  ──────────────────────────────────────")
+        typer.echo(f"  Federal Itemized:      ${detail.federal_total_itemized:>12,.2f}")
+        typer.echo(f"  Standard Deduction:    ${detail.federal_standard_deduction:>12,.2f}")
+        label = "ITEMIZED" if detail.federal_used_itemized else "STANDARD"
+        typer.echo(f"  >>> Using {label}:      ${detail.federal_deduction_used:>12,.2f}")
+        typer.echo("")
+        typer.echo(f"  CA Itemized:           ${detail.ca_total_itemized:>12,.2f}")
+        typer.echo(f"  CA Standard:           ${detail.ca_standard_deduction:>12,.2f}")
+        ca_label = "ITEMIZED" if detail.ca_used_itemized else "STANDARD"
+        typer.echo(f"  >>> CA Using {ca_label}: ${detail.ca_deduction_used:>12,.2f}")
+    else:
+        typer.echo(f"  Standard Deduction:    ${result.standard_deduction:>12,.2f}")
+        if result.itemized_deductions:
+            typer.echo(f"  Itemized Deductions:   ${result.itemized_deductions:>12,.2f}")
+        typer.echo(f"  Deduction Used:        ${result.deduction_used:>12,.2f}")
     typer.echo(f"  Taxable Income:        ${result.taxable_income:>12,.2f}")
     typer.echo("")
     typer.echo("FEDERAL TAX")
@@ -375,9 +466,13 @@ def estimate(
     typer.echo(f"  LTCG/QDiv Tax:         ${result.federal_ltcg_tax:>12,.2f}")
     typer.echo(f"  NIIT (3.8%):           ${result.federal_niit:>12,.2f}")
     typer.echo(f"  AMT:                   ${result.federal_amt:>12,.2f}")
+    if result.additional_medicare_tax > 0:
+        typer.echo(f"  Addl Medicare Tax:     ${result.additional_medicare_tax:>12,.2f}")
     typer.echo("  ──────────────────────────────────────")
     typer.echo(f"  Total Federal Tax:     ${result.federal_total_tax:>12,.2f}")
     typer.echo(f"  Federal Withheld:      ${result.federal_withheld:>12,.2f}")
+    if result.additional_medicare_withholding_credit > 0:
+        typer.echo(f"  Addl Medicare Credit:  ${result.additional_medicare_withholding_credit:>12,.2f}")
     if result.federal_estimated_payments > 0:
         typer.echo(f"  Est. Payments:         ${result.federal_estimated_payments:>12,.2f}")
     typer.echo(f"  Federal Balance Due:   ${result.federal_balance_due:>12,.2f}")
