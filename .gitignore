@@ -36,5 +36,8 @@ inputs/*.csv
 inputs/*.pdf
 inputs/*.json
 
+# Generated reports
+reports/
+
 # Binary files / resources
 resources/*

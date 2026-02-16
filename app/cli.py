@@ -1491,6 +1491,20 @@ def parse(
             typer.echo(f"  - {note}")
 
 
+@app.command()
+def wizard(
+    db: Path = typer.Option(
+        Path.home() / ".taxbot" / "taxbot.db",
+        "--db",
+        help="Path to the SQLite database file",
+    ),
+) -> None:
+    """Interactive step-by-step tax processing wizard."""
+    from app.wizard import run_wizard
+
+    run_wizard(db)
+
+
 if __name__ == "__main__":
     show_mascot()
     app()
