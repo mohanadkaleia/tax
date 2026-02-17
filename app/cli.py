@@ -1492,6 +1492,69 @@ def parse(
 
 
 @app.command()
+def chat(
+    db: Path = typer.Option(
+        Path.home() / ".taxbot" / "taxbot.db",
+        "--db",
+        help="Path to the SQLite database file",
+    ),
+    year: int = typer.Option(2024, "--year", "-y", help="Tax year for context"),
+    model: str = typer.Option(
+        "claude-sonnet-4-20250514",
+        "--model",
+        "-m",
+        help="Claude model to use",
+    ),
+) -> None:
+    """Interactive CPA expert chat for tax questions."""
+    import os
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        typer.echo(
+            "Error: ANTHROPIC_API_KEY environment variable is not set.\n"
+            "Set it with: export ANTHROPIC_API_KEY=your-key-here",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    try:
+        import anthropic
+    except ImportError:
+        typer.echo(
+            "Error: anthropic package not installed. Run: pip install anthropic",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    try:
+        from rich.console import Console
+    except ImportError:
+        typer.echo(
+            "Error: rich package not installed. Run: pip install rich",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    from app.chat import build_system_prompt, run_chat
+    from app.db.repository import TaxRepository
+    from app.db.schema import create_schema
+
+    # Initialize database (creates if needed)
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = create_schema(db)
+    repo = TaxRepository(conn)
+
+    system_prompt = build_system_prompt(repo, year)
+    conn.close()
+
+    client = anthropic.Anthropic(api_key=api_key)
+    console = Console()
+
+    run_chat(console, client, model, system_prompt)
+
+
+@app.command()
 def wizard(
     db: Path = typer.Option(
         Path.home() / ".taxbot" / "taxbot.db",
