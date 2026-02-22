@@ -60,9 +60,9 @@ class TestBuildSystemPrompt:
 
         assert "Senior Certified Public Accountant" in prompt
         assert "W-2 Forms: None imported" in prompt
-        assert "Sales: None imported" in prompt
+        assert "Sale Results: Reconciliation not yet run" in prompt
         assert "Lots: None imported" in prompt
-        assert "Events: None imported" in prompt
+        assert "Equity Events: None imported" in prompt
         assert "Reconciliation: Not yet run" in prompt
 
 

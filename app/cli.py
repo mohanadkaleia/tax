@@ -236,9 +236,22 @@ def _process_pdf(file_path: Path, year: int, repo: Any) -> dict:
                     data = extractor_v.extract(images, detected_type)
                     used_vision = True
 
-    # 4. Validate extraction
+    # 4. Validate extraction (fall back to Vision if validation fails)
     regex_extractor = get_extractor(detected_type)
     errors = regex_extractor.validate_extraction(data)
+    if errors and not used_vision and os.environ.get("ANTHROPIC_API_KEY"):
+        from app.parsing.vision import VisionExtractor
+
+        typer.echo(
+            f"  {file_path.name}: Regex extraction incomplete, falling back to Vision API...",
+            err=True,
+        )
+        extractor_v = VisionExtractor()
+        images = extractor_v.pdf_to_images(file_path)
+        data = extractor_v.extract(images, detected_type)
+        used_vision = True
+        errors = regex_extractor.validate_extraction(data)
+
     if errors:
         raise ValueError(
             f"Extraction errors in {file_path.name}: " + "; ".join(errors)

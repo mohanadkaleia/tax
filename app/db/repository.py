@@ -427,6 +427,16 @@ class TaxRepository:
 
         Returns the number of lots deleted.
         """
+        # Remove sale_results and sales referencing auto-created lots first (FK)
+        self.conn.execute(
+            "DELETE FROM sale_results WHERE lot_id IN "
+            "(SELECT id FROM lots WHERE notes LIKE 'Auto-created%')"
+        )
+        self.conn.execute(
+            "DELETE FROM sales WHERE lot_id IN "
+            "(SELECT id FROM lots WHERE notes LIKE 'Auto-created%')"
+        )
+
         # Delete auto-created lots
         cursor = self.conn.execute(
             "DELETE FROM lots WHERE notes LIKE 'Auto-created%'"

@@ -41,77 +41,186 @@ def _fmt_decimal(value: str | None) -> str:
     return f"${Decimal(value):,.2f}"
 
 
+def _fmt_box12(codes: dict | None) -> str:
+    """Format W-2 Box 12 codes as a compact string."""
+    if not codes:
+        return "none"
+    return ", ".join(f"{k}={_fmt_decimal(v)}" for k, v in codes.items())
+
+
+def _fmt_box14(other: dict | None) -> str:
+    """Format W-2 Box 14 (Other) as a compact string."""
+    if not other:
+        return "none"
+    return ", ".join(f"{k}={_fmt_decimal(v)}" for k, v in other.items())
+
+
 def build_system_prompt(repo: TaxRepository, year: int) -> str:
-    """Build a system prompt with CPA identity and DB context summary."""
+    """Build a system prompt with CPA identity and detailed DB data."""
     sections = [CPA_IDENTITY]
 
     # --- Gather data context ---
     context_parts: list[str] = []
 
-    # W-2s
+    # W-2s — full box detail
     w2s = repo.get_w2s(year)
     if w2s:
         lines = [f"W-2 Forms ({len(w2s)}):"]
-        for w in w2s:
-            wages = _fmt_decimal(w.get("box1_wages"))
-            fed_wh = _fmt_decimal(w.get("box2_federal_withheld"))
-            state_wh = _fmt_decimal(w.get("box17_state_withheld"))
+        for i, w in enumerate(w2s, 1):
+            lines.append(f"  #{i}: {w['employer_name']} (State: {w.get('state', 'N/A')})")
             lines.append(
-                f"  - {w['employer_name']}: Wages {wages}, "
-                f"Federal withheld {fed_wh}, State withheld {state_wh}"
+                f"      Box 1 Wages: {_fmt_decimal(w.get('box1_wages'))} | "
+                f"Box 2 Fed Withheld: {_fmt_decimal(w.get('box2_federal_withheld'))}"
+            )
+            lines.append(
+                f"      Box 3 SS Wages: {_fmt_decimal(w.get('box3_ss_wages'))} | "
+                f"Box 4 SS Withheld: {_fmt_decimal(w.get('box4_ss_withheld'))}"
+            )
+            lines.append(
+                f"      Box 5 Medicare Wages: {_fmt_decimal(w.get('box5_medicare_wages'))} | "
+                f"Box 6 Medicare Withheld: {_fmt_decimal(w.get('box6_medicare_withheld'))}"
+            )
+            lines.append(f"      Box 12 Codes: {_fmt_box12(w.get('box12_codes'))}")
+            lines.append(f"      Box 14 Other: {_fmt_box14(w.get('box14_other'))}")
+            lines.append(
+                f"      Box 16 State Wages: {_fmt_decimal(w.get('box16_state_wages'))} | "
+                f"Box 17 State Withheld: {_fmt_decimal(w.get('box17_state_withheld'))}"
             )
         context_parts.append("\n".join(lines))
     else:
         context_parts.append("W-2 Forms: None imported.")
 
-    # Sales
-    sales = repo.get_sales(year)
-    if sales:
-        total_proceeds = sum(
-            Decimal(str(s["proceeds_per_share"])) * Decimal(str(s["shares"]))
-            for s in sales
-        )
-        context_parts.append(
-            f"Sales: {len(sales)} sale(s), total proceeds ${total_proceeds:,.2f}"
-        )
-    else:
-        context_parts.append("Sales: None imported.")
-
-    # Sale results (reconciliation output)
+    # Sale results — per-sale detail
     sale_results = repo.get_sale_results(year)
     if sale_results:
         total_gain = sum(Decimal(str(r["gain_loss"])) for r in sale_results)
         total_ordinary = sum(
             Decimal(str(r.get("ordinary_income", "0"))) for r in sale_results
         )
-        context_parts.append(
-            f"Reconciled results: {len(sale_results)} result(s), "
-            f"total gain/loss ${total_gain:,.2f}, "
-            f"ordinary income ${total_ordinary:,.2f}"
-        )
+        lines = [
+            f"Sale Results ({len(sale_results)}) — "
+            f"Total Gain/Loss: ${total_gain:,.2f}, "
+            f"Total Ordinary Income: ${total_ordinary:,.2f}:"
+        ]
+        for i, r in enumerate(sale_results, 1):
+            security = r.get("security_name") or r.get("sale_id", "?")
+            acq = r.get("acquisition_date", "?")
+            sold = r.get("sale_date", "?")
+            shares = r.get("shares", "?")
+            lines.append(
+                f"  #{i}: {security} | Acquired {acq} | Sold {sold} | {shares} shares"
+            )
+            proceeds = _fmt_decimal(r.get("proceeds"))
+            broker_basis = _fmt_decimal(r.get("broker_reported_basis"))
+            correct_basis = _fmt_decimal(r.get("correct_basis"))
+            lines.append(
+                f"      Proceeds: {proceeds} | Broker Basis: {broker_basis} | "
+                f"Correct Basis: {correct_basis}"
+            )
+            adj_code = r.get("adjustment_code", "")
+            adj_amt = _fmt_decimal(r.get("adjustment_amount"))
+            holding = r.get("holding_period", "?")
+            category = r.get("form_8949_category", "?")
+            gain = _fmt_decimal(r.get("gain_loss"))
+            lines.append(
+                f"      Adj: {adj_code} {adj_amt} | {holding} | "
+                f"8949 Cat: {category} | Gain/Loss: {gain}"
+            )
+            ordinary = r.get("ordinary_income", "0")
+            amt_adj = r.get("amt_adjustment", "0")
+            wash = r.get("wash_sale_disallowed", "0")
+            detail_parts = []
+            if Decimal(str(ordinary)) != 0:
+                detail_parts.append(f"Ordinary Income: {_fmt_decimal(ordinary)}")
+            if Decimal(str(amt_adj)) != 0:
+                detail_parts.append(f"AMT Adj: {_fmt_decimal(amt_adj)}")
+            if Decimal(str(wash)) != 0:
+                detail_parts.append(f"Wash Sale Disallowed: {_fmt_decimal(wash)}")
+            if r.get("notes"):
+                detail_parts.append(f"Notes: {r['notes']}")
+            if detail_parts:
+                lines.append(f"      {' | '.join(detail_parts)}")
+        context_parts.append("\n".join(lines))
     else:
-        context_parts.append("Reconciled results: Not yet run.")
+        context_parts.append("Sale Results: Reconciliation not yet run.")
 
-    # Lots
+    # Lots — per-lot detail
     lots = repo.get_lots()
     if lots:
-        equity_types = sorted({lt.get("equity_type", "?") for lt in lots})
-        context_parts.append(
-            f"Lots: {len(lots)} lot(s), equity types: {', '.join(equity_types)}"
-        )
+        lines = [f"Lots ({len(lots)}):"]
+        for i, lt in enumerate(lots, 1):
+            eq_type = lt.get("equity_type", "?")
+            ticker = lt.get("ticker", "?")
+            acq = lt.get("acquisition_date", "?")
+            shares = lt.get("shares", "?")
+            remaining = lt.get("shares_remaining", "?")
+            cost = _fmt_decimal(lt.get("cost_per_share"))
+            lines.append(
+                f"  #{i}: {eq_type} {ticker} | Acquired {acq} | "
+                f"{shares} shares ({remaining} remaining) | Cost/sh: {cost}"
+            )
+            detail_parts = []
+            if lt.get("amt_cost_per_share"):
+                detail_parts.append(
+                    f"AMT Cost/sh: {_fmt_decimal(lt['amt_cost_per_share'])}"
+                )
+            if lt.get("notes"):
+                detail_parts.append(f"Notes: {lt['notes']}")
+            if detail_parts:
+                lines.append(f"      {' | '.join(detail_parts)}")
+        context_parts.append("\n".join(lines))
     else:
         context_parts.append("Lots: None imported.")
 
-    # Events
+    # Equity events — per-event detail
     events = repo.get_events()
     if events:
-        from collections import Counter
-
-        type_counts = Counter(ev.get("event_type", "?") for ev in events)
-        breakdown = ", ".join(f"{t}: {c}" for t, c in sorted(type_counts.items()))
-        context_parts.append(f"Events: {len(events)} total ({breakdown})")
+        lines = [f"Equity Events ({len(events)}):"]
+        for i, ev in enumerate(events, 1):
+            ev_type = ev.get("event_type", "?")
+            eq_type = ev.get("equity_type", "?")
+            ticker = ev.get("ticker", "?")
+            ev_date = ev.get("event_date", "?")
+            shares = ev.get("shares", "?")
+            price = _fmt_decimal(ev.get("price_per_share"))
+            lines.append(
+                f"  #{i}: {ev_type} {eq_type} {ticker} | Date {ev_date} | "
+                f"{shares} shares @ {price}"
+            )
+            detail_parts = []
+            if ev.get("strike_price"):
+                detail_parts.append(f"Strike: {_fmt_decimal(ev['strike_price'])}")
+            if ev.get("purchase_price"):
+                detail_parts.append(f"Purchase Price: {_fmt_decimal(ev['purchase_price'])}")
+            if ev.get("grant_date"):
+                detail_parts.append(f"Grant Date: {ev['grant_date']}")
+            if ev.get("offering_date"):
+                detail_parts.append(f"Offering Date: {ev['offering_date']}")
+            if ev.get("fmv_on_offering_date"):
+                detail_parts.append(
+                    f"FMV at Offering: {_fmt_decimal(ev['fmv_on_offering_date'])}"
+                )
+            if ev.get("ordinary_income"):
+                detail_parts.append(
+                    f"Ordinary Income: {_fmt_decimal(ev['ordinary_income'])}"
+                )
+            if detail_parts:
+                lines.append(f"      {' | '.join(detail_parts)}")
+        context_parts.append("\n".join(lines))
     else:
-        context_parts.append("Events: None imported.")
+        context_parts.append("Equity Events: None imported.")
+
+    # Import batches
+    batches = repo.get_import_batches(year)
+    if batches:
+        lines = [f"Import Batches ({len(batches)}):"]
+        for b in batches:
+            source = b.get("source", "?")
+            fpath = b.get("file_path", "?")
+            form_type = b.get("form_type", "?")
+            count = b.get("record_count", 0)
+            lines.append(f"  - {source}: {form_type} from {fpath} ({count} records)")
+        context_parts.append("\n".join(lines))
 
     # Reconciliation runs
     recon_runs = repo.get_reconciliation_runs(year)
@@ -126,21 +235,52 @@ def build_system_prompt(repo: TaxRepository, year: int) -> str:
     else:
         context_parts.append("Reconciliation: Not yet run.")
 
-    # 1099-DIV
+    # 1099-DIV — per-form detail
     divs = repo.get_1099divs(year)
     if divs:
-        total_ord = sum(Decimal(str(d.get("ordinary_dividends", "0"))) for d in divs)
-        total_qual = sum(Decimal(str(d.get("qualified_dividends", "0"))) for d in divs)
-        context_parts.append(
-            f"1099-DIV: {len(divs)} form(s), "
-            f"ordinary ${total_ord:,.2f}, qualified ${total_qual:,.2f}"
-        )
+        lines = [f"1099-DIV Forms ({len(divs)}):"]
+        for i, d in enumerate(divs, 1):
+            payer = d.get("payer_name", "?")
+            ordinary = _fmt_decimal(d.get("ordinary_dividends"))
+            qualified = _fmt_decimal(d.get("qualified_dividends"))
+            cap_gain = _fmt_decimal(d.get("capital_gain_distributions"))
+            lines.append(
+                f"  #{i}: {payer} | Ordinary: {ordinary} | Qualified: {qualified} | "
+                f"Cap Gain Dist: {cap_gain}"
+            )
+            detail_parts = []
+            if d.get("section_199a_dividends") and Decimal(str(d["section_199a_dividends"])) != 0:
+                detail_parts.append(f"199A: {_fmt_decimal(d['section_199a_dividends'])}")
+            if d.get("foreign_tax_paid") and Decimal(str(d["foreign_tax_paid"])) != 0:
+                detail_parts.append(f"Foreign Tax: {_fmt_decimal(d['foreign_tax_paid'])}")
+            if d.get("federal_tax_withheld") and Decimal(str(d["federal_tax_withheld"])) != 0:
+                detail_parts.append(f"Fed Withheld: {_fmt_decimal(d['federal_tax_withheld'])}")
+            if d.get("state_tax_withheld") and Decimal(str(d["state_tax_withheld"])) != 0:
+                detail_parts.append(f"State Withheld: {_fmt_decimal(d['state_tax_withheld'])}")
+            if detail_parts:
+                lines.append(f"      {' | '.join(detail_parts)}")
+        context_parts.append("\n".join(lines))
 
-    # 1099-INT
+    # 1099-INT — per-form detail
     ints = repo.get_1099ints(year)
     if ints:
-        total_int = sum(Decimal(str(i.get("interest_income", "0"))) for i in ints)
-        context_parts.append(f"1099-INT: {len(ints)} form(s), total ${total_int:,.2f}")
+        lines = [f"1099-INT Forms ({len(ints)}):"]
+        for i, n in enumerate(ints, 1):
+            payer = n.get("payer_name", "?")
+            interest = _fmt_decimal(n.get("interest_income"))
+            lines.append(f"  #{i}: {payer} | Interest: {interest}")
+            detail_parts = []
+            if n.get("us_savings_bond_interest") and Decimal(str(n["us_savings_bond_interest"])) != 0:
+                detail_parts.append(f"US Bond Int: {_fmt_decimal(n['us_savings_bond_interest'])}")
+            if n.get("early_withdrawal_penalty") and Decimal(str(n["early_withdrawal_penalty"])) != 0:
+                detail_parts.append(f"Early W/D Penalty: {_fmt_decimal(n['early_withdrawal_penalty'])}")
+            if n.get("federal_tax_withheld") and Decimal(str(n["federal_tax_withheld"])) != 0:
+                detail_parts.append(f"Fed Withheld: {_fmt_decimal(n['federal_tax_withheld'])}")
+            if n.get("state_tax_withheld") and Decimal(str(n["state_tax_withheld"])) != 0:
+                detail_parts.append(f"State Withheld: {_fmt_decimal(n['state_tax_withheld'])}")
+            if detail_parts:
+                lines.append(f"      {' | '.join(detail_parts)}")
+        context_parts.append("\n".join(lines))
 
     if context_parts:
         sections.append(
