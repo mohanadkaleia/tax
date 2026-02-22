@@ -1,7 +1,7 @@
 > THIS PROJECT IS ONLY FOR TESTING - NEVER USE IT FOR REAL DATA AND NEVER TRUST THE RESULTS.
 
 # TaxBot 9000
-```bash
+```
       _____
      /     \
     | () () |
@@ -21,175 +21,82 @@
   "I found $0 basis...again."
 ```
 
-A Python-based tax reconciliation system for U.S. equity compensation. It processes W-2s, 1099-Bs, Forms 3921/3922, and brokerage statements from Morgan Stanley Shareworks and Robinhood to produce corrected cost-basis reports, tax estimates, and filing-ready Form 8949 output.
+A Python CLI tool that processes U.S. tax documents for equity compensation (RSUs, ESPP, ISOs, NSOs). It ingests W-2s, 1099-Bs, Forms 3921/3922, and brokerage statements, then corrects cost basis, computes ESPP ordinary income, and estimates federal + California tax liability.
 
-Designed for a single California-resident W-2 employee with RSUs, ISOs, NSOs, and ESPP shares.
+## Architecture
 
-## What It Does
+```
+                  ┌─────────────────────────────────┐
+                  │          CLI (Typer)             │
+                  │  import · reconcile · estimate   │
+                  └──────────┬──────────────────────┘
+                             │
+              ┌──────────────┼──────────────────┐
+              ▼              ▼                  ▼
+      ┌──────────────┐ ┌───────────┐   ┌──────────────┐
+      │   Parsing     │ │  Engines  │   │   Reports    │
+      │              │ │           │   │              │
+      │ PDF/CSV/JSON │ │ Basis     │   │ Form 8949    │
+      │ detection &  │ │ ESPP      │   │ ESPP Income  │
+      │ extraction   │ │ ISO/AMT   │   │ Reconcile    │
+      │              │ │ Estimator │   │              │
+      └──────┬───────┘ └─────┬─────┘   └──────────────┘
+             │               │
+             ▼               ▼
+      ┌────────────────────────────┐
+      │     SQLite Database        │
+      │  sales · lots · events     │
+      │  w2s · import_batches      │
+      └────────────────────────────┘
+```
 
-- **Cost-basis correction** — Fixes the broker-reported basis that is often $0 or incomplete for equity compensation sales.
-- **Form 8949 generation** — Produces IRS-ready sales schedules with proper adjustment codes (B, e, O).
-- **ESPP income computation** — Determines qualifying vs. disqualifying dispositions and computes ordinary income to prevent double taxation.
-- **ISO AMT tracking** — Calculates AMT preference items and tracks credit carryforwards across tax years.
-- **Tax estimation** — Computes federal and California state tax liability with progressive brackets, NIIT, and AMT.
-- **Strategy recommendations** — Analyzes tax-loss harvesting, ESPP holding period optimization, ISO exercise timing, and more.
-- **Reconciliation reports** — Audit trail comparing broker-reported values against corrected values for every transaction.
+**Import** parses PDFs (via Vision API), CSVs, and JSON files, auto-detects the form type (W-2, 1099-B, 3922, etc.), and stores normalized records in SQLite. Duplicate detection prevents the same sales, events, and lots from being imported twice.
 
-## Supported Inputs
+**Reconcile** matches each sale to its purchase lot (FIFO), corrects the cost basis, computes ESPP ordinary income (qualifying vs. disqualifying), and generates Form 8949 adjustment codes.
 
-| Form / Source | Description |
-|---|---|
-| W-2 | Wages, withholdings, equity comp income (Boxes 12, 14) |
-| 1099-B | Brokerage proceeds and cost-basis data |
-| 1099-DIV | Dividend income |
-| 1099-INT | Interest income |
-| Form 3921 | ISO exercise records |
-| Form 3922 | ESPP transfer records |
-| Shareworks | Morgan Stanley supplemental lot-level detail |
-| Robinhood | Consolidated 1099 data |
-
-## Requirements
-
-- Python 3.11+
+**Estimate** pulls reconciled data and W-2 info to compute federal and California tax liability with progressive brackets, NIIT, AMT, and mental health surcharge.
 
 ## Setup
 
 ```bash
-# Clone the repository
-git clone <repo-url>
-cd tax
-
-# Create and activate a virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
-
-# Install the package with dev dependencies
 pip install -e ".[dev]"
 ```
 
 ## Usage
 
-All commands are available through the CLI:
+```bash
+# 1. Import tax documents (scans directory for PDFs, CSVs, JSON files)
+python -m app.cli import ~/Desktop/tax_2024/ --year 2024
+
+# 2. Reconcile sales against lots and correct cost basis
+python -m app.cli reconcile 2024
+
+# 3. Estimate tax liability
+python -m app.cli estimate 2024
+```
+
+To start fresh, delete the database and re-import:
 
 ```bash
-# Show available commands
-python -m app.cli --help
-
-# Import data from a brokerage source
-python -m app.cli import-data shareworks inputs/1099b.csv --year 2025
-python -m app.cli import-data robinhood inputs/robinhood_1099.csv --year 2025
-python -m app.cli import-data manual inputs/w2.json --year 2025
-
-# Run cost-basis reconciliation
-python -m app.cli reconcile 2025
-
-# Compute estimated tax liability
-python -m app.cli estimate 2025
-
-# Run tax strategy analysis
-python -m app.cli strategy 2025
-
-# Generate all reports to an output directory
-python -m app.cli report 2025 --output reports/
+rm ~/.taxbot/taxbot.db
+python -m app.cli import ~/Desktop/tax_2024/ --year 2024
+python -m app.cli reconcile 2024
+python -m app.cli estimate 2024
 ```
 
-## Project Structure
+### Tips
 
-```
-app/
-  cli.py                  # Typer CLI entry point
-  exceptions.py           # Typed error hierarchy
-  ingestion/              # Import adapters
-    base.py               #   Abstract adapter interface
-    shareworks.py          #   Morgan Stanley Shareworks
-    robinhood.py           #   Robinhood
-    manual.py              #   Manual entry (W-2, 3921, 3922)
-  normalization/          # Canonical ledger and event processing
-    events.py              #   Event deduplication and validation
-    ledger.py              #   Lot builder and sale matching
-  engines/                # Tax computation engines
-    basis.py               #   Cost-basis correction (RSU, NSO, ESPP, ISO)
-    espp.py                #   ESPP qualifying/disqualifying disposition logic
-    iso_amt.py             #   ISO AMT preference and credit tracking
-    estimator.py           #   Federal + California tax estimation
-    strategy.py            #   Tax strategy recommendations
-    lot_matcher.py         #   FIFO and specific-ID lot matching
-    brackets.py            #   Tax bracket configuration (federal + CA)
-  models/                 # Pydantic data models
-    enums.py               #   EquityType, FilingStatus, Form8949Category, etc.
-    equity_event.py        #   Security, Lot, EquityEvent, Sale, SaleResult
-    tax_forms.py           #   W2, Form1099B, Form3921, Form3922, etc.
-    reports.py             #   Form8949Line, TaxEstimate, AuditEntry, etc.
-  db/                     # SQLite persistence
-    schema.py              #   Database schema definition
-    repository.py          #   Data access layer
-    migrations.py          #   Schema versioning
-  reports/                # Report generators
-    form8949.py            #   Form 8949 output
-    espp_report.py         #   ESPP income report
-    amt_worksheet.py       #   ISO AMT worksheet
-    reconciliation.py      #   Broker vs. corrected basis comparison
-    strategy_report.py     #   Strategy recommendations
-    templates/             #   Jinja2 report templates
-inputs/                   # Raw tax documents (not committed)
-plans/                    # Agent collaboration plans
-resources/                # IRS publications and reference materials
-tests/                    # Pytest test suite
-```
+- Only put annual tax forms (W-2, 1099-B, 3922) in the import directory. Quarterly statements create duplicate aggregate sales.
+- Form 3922 data can also be provided as JSON in a separate directory (see `inputs/` for the schema).
+- The import command deduplicates sales, events, and lots automatically, so re-importing the same file is safe.
 
 ## Running Tests
 
 ```bash
-# Run all tests
 python -m pytest tests/ -v
-
-# Run a specific test file
-python -m pytest tests/test_engines/test_basis.py -v
-
-# Run with short summary
-python -m pytest tests/ --tb=short
 ```
-
-## Linting
-
-```bash
-ruff check app/ tests/
-```
-
-## Key Design Decisions
-
-- **Decimal everywhere** — All monetary values use Python's `Decimal` type, never `float`, to avoid rounding errors on tax forms.
-- **Dual-basis tracking** — ISOs maintain both regular tax basis and AMT basis from day one.
-- **Immutable audit trail** — Every computation step is logged for traceability and review.
-- **Configurable brackets** — Tax brackets are stored as data structures keyed by year and filing status, not hardcoded in formulas.
-- **Broker data is never trusted** — The entire system is built around the assumption that broker-reported cost basis is wrong and must be corrected.
-
-## Tax Domain Overview
-
-| Equity Type | Income Event | Basis Rule | Key Form |
-|---|---|---|---|
-| RSU | Ordinary income at vest (W-2) | FMV at vest date | 1099-B |
-| NSO | Ordinary income at exercise (W-2 Box 12 Code V) | Strike + recognized income | 1099-B |
-| ESPP | Ordinary income at sale (qualifying or disqualifying) | Purchase price + ordinary income | 3922, 1099-B |
-| ISO | No regular income at exercise; AMT preference | Strike (regular) / FMV at exercise (AMT) | 3921, 6251 |
-
-## Development Status
-
-The project skeleton is complete with working engines for:
-- RSU and NSO cost-basis correction
-- ESPP qualifying/disqualifying disposition computation
-- ISO AMT preference calculation
-- Federal and California tax estimation
-- FIFO lot matching
-
-Ingestion adapters (Shareworks, Robinhood, manual) are stubbed and ready for implementation.
-
-## Security
-
-- All data is stored locally. No network calls, no cloud services.
-- SQLite database uses WAL mode.
-- No SSNs, real taxpayer data, or secrets are committed to source control.
-- Input files in `inputs/` are gitignored by default.
 
 ## License
 
