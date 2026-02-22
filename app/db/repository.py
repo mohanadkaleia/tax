@@ -396,6 +396,28 @@ class TaxRepository:
         self.conn.execute("UPDATE lots SET shares_remaining = shares")
         self.conn.commit()
 
+    def delete_auto_lots_for_ticker(self, ticker: str) -> int:
+        """Delete auto-created lots for a specific ticker.
+
+        Used when importing real vest data from Shareworks to replace
+        auto-created lots from reconciliation.
+
+        Returns the number of lots deleted.
+        """
+        cursor = self.conn.execute(
+            "DELETE FROM lots WHERE ticker = ? AND notes LIKE 'Auto-created%'",
+            (ticker,),
+        )
+        deleted = cursor.rowcount
+        if deleted > 0:
+            # Clean up orphan events
+            self.conn.execute(
+                "DELETE FROM equity_events WHERE id NOT IN "
+                "(SELECT source_event_id FROM lots WHERE source_event_id IS NOT NULL)"
+            )
+        self.conn.commit()
+        return deleted
+
     def delete_auto_created_lots(self) -> int:
         """Delete lots that were auto-created during reconciliation.
 

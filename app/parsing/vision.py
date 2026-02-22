@@ -17,13 +17,22 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 3
 INITIAL_BACKOFF = 1.0
 MAX_IMAGE_BYTES = 4_500_000  # Stay under API's 5 MB limit
+MAX_IMAGE_DIMENSION = 7999  # API rejects images with any dimension > 8000px
 
 
 def _compress_image(pil_image, max_bytes: int = MAX_IMAGE_BYTES) -> bytes:
     """Compress a PIL image to fit within the API size limit.
 
-    Tries JPEG at decreasing quality, then scales down if still too large.
+    Ensures no dimension exceeds MAX_IMAGE_DIMENSION (8000px API limit),
+    then tries JPEG at decreasing quality, then scales down if still too large.
     """
+    # Enforce the 8000px dimension limit before anything else
+    w, h = pil_image.size
+    if w > MAX_IMAGE_DIMENSION or h > MAX_IMAGE_DIMENSION:
+        scale = min(MAX_IMAGE_DIMENSION / w, MAX_IMAGE_DIMENSION / h)
+        new_size = (int(w * scale), int(h * scale))
+        pil_image = pil_image.resize(new_size)
+
     # Try JPEG at quality 85 first (much smaller than PNG for photos/scans)
     for quality in (85, 60, 40):
         buf = io.BytesIO()

@@ -61,6 +61,7 @@ class ManualAdapter(BaseAdapter):
             FormType.FORM_1099INT: self._parse_1099int,
             FormType.FORM_3921: self._parse_3921,
             FormType.FORM_3922: self._parse_3922,
+            FormType.SHAREWORKS_RSU_RELEASE: self._parse_shareworks_rsu,
             FormType.EQUITY_LOTS: self._parse_equity_lots,
         }
         return dispatch[form_type](raw)
@@ -74,6 +75,7 @@ class ManualAdapter(BaseAdapter):
             FormType.FORM_1099INT: self._validate_1099int,
             FormType.FORM_3921: self._validate_3921,
             FormType.FORM_3922: self._validate_3922,
+            FormType.SHAREWORKS_RSU_RELEASE: self._validate_shareworks_rsu,
             FormType.EQUITY_LOTS: self._validate_equity_lots,
         }
         return dispatch[data.form_type](data)
@@ -91,6 +93,8 @@ class ManualAdapter(BaseAdapter):
 
         if "box1_wages" in sample or "box2_federal_withheld" in sample:
             return FormType.W2
+        if "vest_date" in sample and "release_price" in sample and "shares_vested" in sample:
+            return FormType.SHAREWORKS_RSU_RELEASE
         if "equity_type" in sample and "cost_per_share" in sample and "acquisition_date" in sample:
             return FormType.EQUITY_LOTS
         if "exercise_price_per_share" in sample and "fmv_on_exercise_date" in sample:
@@ -348,6 +352,64 @@ class ManualAdapter(BaseAdapter):
             lots=lots,
         )
 
+    def _parse_shareworks_rsu(self, raw: list | dict) -> ImportResult:
+        records = raw if isinstance(raw, list) else [raw]
+        events = []
+        lots = []
+        tax_year = 0
+
+        for record in records:
+            vest_date = date.fromisoformat(record["vest_date"])
+            tax_year = tax_year or vest_date.year
+            release_price = Decimal(str(record["release_price"]))
+            shares_net = Decimal(str(record["shares_net"]))
+            shares_vested = Decimal(str(record["shares_vested"]))
+            corporation = record.get("corporation_name", "Unknown")
+            taxable_compensation = _decimal_or_none(record.get("taxable_compensation"))
+            grant_name = record.get("grant_name", "")
+            grant_date_str = record.get("grant_date")
+            grant_date_val = date.fromisoformat(grant_date_str) if grant_date_str else None
+
+            event_id = str(uuid4())
+            event = EquityEvent(
+                id=event_id,
+                event_type=TransactionType.VEST,
+                equity_type=EquityType.RSU,
+                security=Security(
+                    ticker=_detect_ticker(corporation),
+                    name=f"RSU Vest ({corporation})",
+                ),
+                event_date=vest_date,
+                shares=shares_vested,
+                price_per_share=release_price,
+                grant_date=grant_date_val,
+                ordinary_income=taxable_compensation,
+                broker_source=BrokerSource.SHAREWORKS,
+            )
+            events.append(event)
+
+            lot = Lot(
+                id=str(uuid4()),
+                equity_type=EquityType.RSU,
+                security=event.security,
+                acquisition_date=vest_date,
+                shares=shares_net,
+                cost_per_share=release_price,
+                amt_cost_per_share=None,
+                shares_remaining=shares_net,
+                source_event_id=event_id,
+                broker_source=BrokerSource.SHAREWORKS,
+                notes=f"Shareworks RSU release: {grant_name}" if grant_name else None,
+            )
+            lots.append(lot)
+
+        return ImportResult(
+            form_type=FormType.SHAREWORKS_RSU_RELEASE,
+            tax_year=tax_year,
+            events=events,
+            lots=lots,
+        )
+
     # --- Validators ---
 
     def _validate_w2(self, data: ImportResult) -> list[str]:
@@ -438,6 +500,20 @@ class ManualAdapter(BaseAdapter):
                 )
             if form.shares_transferred <= 0:
                 errors.append("3922: shares_transferred must be > 0")
+        return errors
+
+    def _validate_shareworks_rsu(self, data: ImportResult) -> list[str]:
+        errors = []
+        for i, lot in enumerate(data.lots):
+            if lot.shares <= 0:
+                errors.append(f"RSU vest {i + 1}: shares_net must be > 0")
+            if lot.cost_per_share <= 0:
+                errors.append(f"RSU vest {i + 1}: release_price must be > 0")
+        for i, event in enumerate(data.events):
+            if event.shares <= 0:
+                errors.append(f"RSU vest {i + 1}: shares_vested must be > 0")
+            if event.ordinary_income is not None and event.ordinary_income < 0:
+                errors.append(f"RSU vest {i + 1}: taxable_compensation must be >= 0")
         return errors
 
     # --- Equity lots (manual lot entries) ---

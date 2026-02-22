@@ -20,7 +20,10 @@ FORM_DETECTION_PROMPT = """Look at these tax document page(s) and identify the f
 Return JSON in this exact format:
 {"form_type": "<type>"}
 
-Where <type> is one of: "w2", "1099b", "1099div", "1099int", "3921", "3922"
+Where <type> is one of: "w2", "1099b", "1099div", "1099int", "3921", "3922", "shareworks_rsu_release"
+
+If you see a Shareworks "Releases Report" or "RSU Vest Details" document with columns like
+"Release Price (Cost Basis)", "Vest Date", "Vested", "Withheld for Taxes", return "shareworks_rsu_release".
 
 IMPORTANT: This may be a COMPOSITE brokerage statement (e.g., from Robinhood, Morgan Stanley,
 Schwab, Fidelity) that contains multiple form types (1099-B, 1099-DIV, 1099-INT) in one document.
@@ -219,6 +222,44 @@ Notes:
 - shares_transferred = Box 6 (integer, no decimals)
 """
 
+SHAREWORKS_RSU_RELEASE_PROMPT = """Extract all RSU vest records from this Shareworks "Releases Report (Details)" PDF.
+
+This document contains a wide table with repeating row groups per vest event. Each vest has
+multiple rows: a summary row with release details, and tax rows for federal/state withholding.
+
+Return a JSON array with one record per vest event:
+[
+  {
+    "grant_name": "RSU - P4P 2020",
+    "grant_date": "2021-02-03",
+    "vest_date": "2021-05-20",
+    "release_price": "224.80",
+    "shares_vested": 142,
+    "shares_withheld": 57,
+    "shares_sold": 0,
+    "shares_net": 85,
+    "taxable_compensation": "31921.60",
+    "corporation_name": "Coinbase"
+  }
+]
+
+Notes:
+- vest_date = "Release Date" or "Vest Date" column (the date shares vested)
+- release_price = "Release Price (Cost Basis)" column (FMV per share at vest = cost basis)
+- shares_vested = "Vested" column (gross shares before withholding)
+- shares_withheld = "Withheld for Taxes" column (shares withheld for tax)
+- shares_sold = "Sold" column (shares sold to cover, often 0)
+- shares_net = "Net" column (net shares = vested - withheld - sold)
+- taxable_compensation = "Taxable Compensation" column (ordinary income = vested × FMV)
+- grant_name = "Grant Name" column (identifies the specific grant)
+- grant_date = "Grant Date" column (original grant date of the RSU award)
+- corporation_name = Company name from the report header (e.g., "Coinbase")
+- Extract EVERY vest event row. Do not skip or summarize.
+- All monetary values as strings with exactly 2 decimal places.
+- All dates in ISO format: YYYY-MM-DD.
+- shares_vested, shares_withheld, shares_sold, shares_net are integers.
+"""
+
 FORM_PROMPTS: dict[FormType, str] = {
     FormType.W2: W2_PROMPT,
     FormType.FORM_1099B: FORM_1099B_PROMPT,
@@ -227,4 +268,5 @@ FORM_PROMPTS: dict[FormType, str] = {
     FormType.FORM_3921: FORM_3921_PROMPT,
     FormType.FORM_3922: FORM_3922_PROMPT,
     FormType.SHAREWORKS_SUPPLEMENTAL: "",  # Not a standard form; parsed by ShareworksAdapter
+    FormType.SHAREWORKS_RSU_RELEASE: SHAREWORKS_RSU_RELEASE_PROMPT,
 }

@@ -13,12 +13,14 @@ class FormType(StrEnum):
     FORM_3921 = "3921"
     FORM_3922 = "3922"
     SHAREWORKS_SUPPLEMENTAL = "shareworks_supplemental"
+    SHAREWORKS_RSU_RELEASE = "shareworks_rsu_release"
     ROBINHOOD_CONSOLIDATED = "robinhood_consolidated"
     EQUITY_LOTS = "equity_lots"
 
 
 # Ordered by specificity (most specific first to avoid false matches)
 FORM_SIGNATURES: list[tuple[FormType, list[str]]] = [
+    (FormType.SHAREWORKS_RSU_RELEASE, ["Releases Report", "Release Price (Cost Basis)", "Vest Date"]),
     (FormType.FORM_3921, ["Form 3921", "Exercise of an Incentive Stock Option"]),
     (FormType.FORM_3922, ["Form 3922", "Transfer of Stock Acquired", "Employee Stock Purchase Plan"]),
     (FormType.FORM_1099B, ["Form 1099-B", "Proceeds From Broker"]),

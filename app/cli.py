@@ -343,21 +343,23 @@ def _print_import_summary(results: list[dict], errors: list[tuple[str, str]], db
         idx += 1
         all_entries.append((
             idx, r["file"], r.get("form_type", "--"),
-            r["forms"], r["events"], r["lots"], r["sales"], "OK",
+            r["forms"], r["events"], r["lots"], r["sales"], "OK", "",
         ))
 
-    for fname, _ in errors:
+    for fname, reason in errors:
         idx += 1
-        all_entries.append((idx, fname, "--", "--", "--", "--", "--", "ERROR"))
+        all_entries.append((idx, fname, "--", "--", "--", "--", "--", "ERROR", reason))
 
     for entry in sorted(all_entries, key=lambda x: x[0]):
-        i, fname, ftype, forms, events, lots, sales, status = entry
+        i, fname, ftype, forms, events, lots, sales, status = entry[:8]
         line = (
             f"  {i:>3} | {fname:<30} | {ftype:<8}"
             f" | {str(forms):>5} | {str(events):>6}"
             f" | {str(lots):>4} | {str(sales):>5} | {status}"
         )
         typer.echo(line)
+        if status == "ERROR" and len(entry) > 8 and entry[8]:
+            typer.echo(f"        Reason: {entry[8]}")
 
     total = len(results) + len(errors)
     typer.echo("")
