@@ -255,9 +255,9 @@ class TestVisionExtractorUnit:
 
 class TestVisionPrompts:
     def test_all_form_types_have_prompts(self):
-        # EQUITY_LOTS, SHAREWORKS_SUPPLEMENTAL, and ROBINHOOD_CONSOLIDATED are
+        # SHAREWORKS_SUPPLEMENTAL and ROBINHOOD_CONSOLIDATED are
         # adapter-only (not PDF/vision), so no vision prompt needed
-        skip = {FormType.EQUITY_LOTS, FormType.SHAREWORKS_SUPPLEMENTAL, FormType.ROBINHOOD_CONSOLIDATED}
+        skip = {FormType.SHAREWORKS_SUPPLEMENTAL, FormType.ROBINHOOD_CONSOLIDATED}
         for ft in FormType:
             if ft in skip:
                 continue

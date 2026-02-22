@@ -62,7 +62,6 @@ class ManualAdapter(BaseAdapter):
             FormType.FORM_3921: self._parse_3921,
             FormType.FORM_3922: self._parse_3922,
             FormType.SHAREWORKS_RSU_RELEASE: self._parse_shareworks_rsu,
-            FormType.EQUITY_LOTS: self._parse_equity_lots,
         }
         return dispatch[form_type](raw)
 
@@ -76,7 +75,6 @@ class ManualAdapter(BaseAdapter):
             FormType.FORM_3921: self._validate_3921,
             FormType.FORM_3922: self._validate_3922,
             FormType.SHAREWORKS_RSU_RELEASE: self._validate_shareworks_rsu,
-            FormType.EQUITY_LOTS: self._validate_equity_lots,
         }
         return dispatch[data.form_type](data)
 
@@ -95,8 +93,6 @@ class ManualAdapter(BaseAdapter):
             return FormType.W2
         if "vest_date" in sample and "release_price" in sample and "shares_vested" in sample:
             return FormType.SHAREWORKS_RSU_RELEASE
-        if "equity_type" in sample and "cost_per_share" in sample and "acquisition_date" in sample:
-            return FormType.EQUITY_LOTS
         if "exercise_price_per_share" in sample and "fmv_on_exercise_date" in sample:
             return FormType.FORM_3921
         if "purchase_price_per_share" in sample and "fmv_on_purchase_date" in sample:
@@ -516,76 +512,6 @@ class ManualAdapter(BaseAdapter):
                 errors.append(f"RSU vest {i + 1}: taxable_compensation must be >= 0")
         return errors
 
-    # --- Equity lots (manual lot entries) ---
-
-    def _parse_equity_lots(self, data: dict | list) -> ImportResult:
-        records = data if isinstance(data, list) else [data]
-        events: list[EquityEvent] = []
-        lots: list[Lot] = []
-
-        for record in records:
-            equity_type = EquityType(record["equity_type"])
-            ticker = record.get("ticker") or _detect_ticker(record.get("security_name", ""))
-            security = Security(
-                ticker=ticker,
-                name=record.get("security_name", ticker),
-            )
-            acquisition_date = date.fromisoformat(record["acquisition_date"])
-            shares = Decimal(str(record["shares"]))
-            cost_per_share = Decimal(str(record["cost_per_share"]))
-            amt_cost = _decimal_or_none(record.get("amt_cost_per_share"))
-            notes = record.get("notes", "")
-
-            event_type_str = record.get("event_type", "VEST")
-            event_type = TransactionType(event_type_str)
-
-            event_id = str(uuid4())
-            event = EquityEvent(
-                id=event_id,
-                event_type=event_type,
-                equity_type=equity_type,
-                security=security,
-                event_date=acquisition_date,
-                shares=shares,
-                price_per_share=cost_per_share,
-                strike_price=_decimal_or_none(record.get("strike_price")),
-                grant_date=date.fromisoformat(record["grant_date"]) if record.get("grant_date") else None,
-                ordinary_income=shares * cost_per_share if equity_type == EquityType.RSU else Decimal("0"),
-                broker_source=BrokerSource(record.get("broker_source", "MANUAL")),
-            )
-            events.append(event)
-
-            lot = Lot(
-                id=str(uuid4()),
-                equity_type=equity_type,
-                security=security,
-                acquisition_date=acquisition_date,
-                shares=shares,
-                cost_per_share=cost_per_share,
-                amt_cost_per_share=amt_cost,
-                shares_remaining=shares,
-                source_event_id=event_id,
-                broker_source=BrokerSource(record.get("broker_source", "MANUAL")),
-                notes=notes,
-            )
-            lots.append(lot)
-
-        tax_year = int(records[0].get("tax_year", acquisition_date.year))
-        return ImportResult(
-            form_type=FormType.EQUITY_LOTS,
-            tax_year=tax_year,
-            events=events,
-            lots=lots,
-        )
-
-    def _validate_equity_lots(self, data: ImportResult) -> list[str]:
-        errors = []
-        for lot in data.lots:
-            if lot.shares <= 0:
-                errors.append(f"Lot {lot.id}: shares must be > 0")
-            if lot.cost_per_share < 0:
-                errors.append(f"Lot {lot.id}: cost_per_share must be >= 0")
-        return errors
 
 
 def _decimal_or_none(value: str | int | float | None) -> Decimal | None:

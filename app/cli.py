@@ -402,11 +402,6 @@ def import_cmd(
     Other Income:
       1099-DIV                Dividend income
       1099-INT                Interest income
-    \b
-    Optional (manual entry via `taxbot add-lot`):
-      Pre-IPO lots            RSU/ISO lots not covered by standard forms
-      Supplemental statements Shareworks/Robinhood lot-level detail
-
     Supported formats: PDF (with Vision API fallback for scans), CSV, JSON.
     Set ANTHROPIC_API_KEY for scanned PDF support.
     """
@@ -1431,112 +1426,6 @@ def report(
 
     typer.echo("")
     typer.echo(f"Done. {reports_generated} report(s) generated in {output}/")
-
-
-@app.command()
-def add_lot(
-    equity_type: str = typer.Argument(..., help="Equity type: RSU, ISO, NSO, ESPP"),
-    ticker: str = typer.Argument(..., help="Stock ticker symbol (e.g. COIN, AAPL)"),
-    acquisition_date: str = typer.Argument(..., help="Date shares were acquired (YYYY-MM-DD)"),
-    shares: int = typer.Argument(..., help="Number of shares"),
-    cost_per_share: float = typer.Argument(..., help="Cost basis per share (e.g. IPO price, strike price)"),
-    name: str = typer.Option(None, "--name", "-n", help="Company/security name"),
-    amt_cost: float | None = typer.Option(None, "--amt-cost", help="AMT cost basis per share (ISOs only)"),
-    event_type: str = typer.Option("VEST", "--event-type", help="Event type: VEST, EXERCISE, PURCHASE"),
-    broker_source: str = typer.Option("MANUAL", "--broker", "-b", help="Broker source: MANUAL, SHAREWORKS, ROBINHOOD"),
-    notes: str = typer.Option("", "--notes", help="Description or notes about this lot"),
-    output: Path = typer.Option(
-        Path("inputs/"),
-        "--output",
-        "-o",
-        help="Output directory for the generated JSON file",
-    ),
-) -> None:
-    """Create a manual equity lot JSON file for import.
-
-    Use this when you have shares not covered by standard tax forms (e.g. pre-IPO
-    RSUs, manual corrections, or lots missing from brokerage statements).
-
-    Examples:
-
-        taxbot add-lot RSU COIN 2020-02-20 181 250 --name "Coinbase" --notes "Pre-IPO RSU"
-
-        taxbot add-lot ISO COIN 2021-04-19 250 18.71 --amt-cost 342.00 --event-type EXERCISE
-    """
-    from datetime import date as date_type
-
-    from app.models.enums import BrokerSource as BS
-    from app.models.enums import EquityType as ET
-    from app.models.enums import TransactionType as TT
-
-    # Validate equity type
-    try:
-        ET(equity_type.upper())
-    except ValueError:
-        valid = ", ".join(e.value for e in ET)
-        typer.echo(f"Error: Invalid equity type '{equity_type}'. Valid: {valid}", err=True)
-        raise typer.Exit(1)
-
-    # Validate event type
-    try:
-        TT(event_type.upper())
-    except ValueError:
-        valid = ", ".join(t.value for t in TT)
-        typer.echo(f"Error: Invalid event type '{event_type}'. Valid: {valid}", err=True)
-        raise typer.Exit(1)
-
-    # Validate broker source
-    try:
-        BS(broker_source.upper())
-    except ValueError:
-        valid = ", ".join(b.value for b in BS)
-        typer.echo(f"Error: Invalid broker source '{broker_source}'. Valid: {valid}", err=True)
-        raise typer.Exit(1)
-
-    # Validate date
-    try:
-        acq_date = date_type.fromisoformat(acquisition_date)
-    except ValueError:
-        typer.echo(f"Error: Invalid date '{acquisition_date}'. Use YYYY-MM-DD format.", err=True)
-        raise typer.Exit(1)
-
-    if shares <= 0:
-        typer.echo("Error: shares must be > 0", err=True)
-        raise typer.Exit(1)
-    if cost_per_share < 0:
-        typer.echo("Error: cost_per_share must be >= 0", err=True)
-        raise typer.Exit(1)
-
-    record = {
-        "tax_year": acq_date.year,
-        "equity_type": equity_type.upper(),
-        "ticker": ticker.upper(),
-        "security_name": name or ticker.upper(),
-        "acquisition_date": acquisition_date,
-        "shares": shares,
-        "cost_per_share": str(Decimal(str(cost_per_share))),
-        "event_type": event_type.upper(),
-        "broker_source": broker_source.upper(),
-        "notes": notes,
-    }
-    if amt_cost is not None:
-        record["amt_cost_per_share"] = str(Decimal(str(amt_cost)))
-
-    # Write to JSON file (append if file exists with same ticker/year)
-    output.mkdir(parents=True, exist_ok=True)
-    base_name = f"equity_lots_{ticker.lower()}_{acq_date.year}"
-    out_path = output / f"{base_name}.json"
-
-    existing: list[dict] = []
-    if out_path.exists():
-        existing = json.loads(out_path.read_text())
-
-    existing.append(record)
-    out_path.write_text(json.dumps(existing, indent=2))
-
-    typer.echo(f"Added {equity_type.upper()} lot: {shares} {ticker.upper()} shares at ${cost_per_share}/share ({acquisition_date})")
-    typer.echo(f"Output: {out_path}")
-    typer.echo(f"Import with: python -m app.cli import {out_path.parent} --year {acq_date.year}")
 
 
 class _DecimalEncoder(json.JSONEncoder):

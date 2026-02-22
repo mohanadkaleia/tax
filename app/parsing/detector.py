@@ -15,7 +15,6 @@ class FormType(StrEnum):
     SHAREWORKS_SUPPLEMENTAL = "shareworks_supplemental"
     SHAREWORKS_RSU_RELEASE = "shareworks_rsu_release"
     ROBINHOOD_CONSOLIDATED = "robinhood_consolidated"
-    EQUITY_LOTS = "equity_lots"
 
 
 # Ordered by specificity (most specific first to avoid false matches)
