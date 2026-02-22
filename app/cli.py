@@ -385,6 +385,30 @@ def import_cmd(
 
     Scans the directory for .pdf, .csv, and .json files, auto-detects
     file types, parses them, and imports into the database.
+
+    For a complete tax estimation, provide the following documents:
+
+    \b
+    Required:
+      W-2                     Wages, withholdings, equity comp (from each employer)
+      1099-B                  Brokerage proceeds and cost basis (Shareworks, Robinhood)
+    \b
+    Equity Compensation:
+      Form 3921               ISO exercise records
+      Form 3922               ESPP transfer/purchase records
+      RSU Releases Report     Shareworks "Releases Report (Details)" with vest
+                              dates, FMV, and share counts (replaces auto-created lots)
+    \b
+    Other Income:
+      1099-DIV                Dividend income
+      1099-INT                Interest income
+    \b
+    Optional (manual entry via `taxbot add-lot`):
+      Pre-IPO lots            RSU/ISO lots not covered by standard forms
+      Supplemental statements Shareworks/Robinhood lot-level detail
+
+    Supported formats: PDF (with Vision API fallback for scans), CSV, JSON.
+    Set ANTHROPIC_API_KEY for scanned PDF support.
     """
     if not directory.exists() or not directory.is_dir():
         typer.echo(f"Error: Directory not found: {directory}", err=True)
