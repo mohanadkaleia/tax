@@ -16,6 +16,7 @@ from app.engines.espp import ESPPEngine
 from app.engines.iso_amt import ISOAMTEngine
 from app.engines.lot_matcher import LotMatcher
 from app.exceptions import MissingEventDataError
+from app.models.data_gaps import DataGap, DataGapReport, GapCategory, GapSeverity
 from app.models.enums import AdjustmentCode, BrokerSource, EquityType, HoldingPeriod, TransactionType
 from app.models.equity_event import EquityEvent, Lot, Sale, SaleResult, Security
 from app.models.reports import AuditEntry
@@ -64,6 +65,7 @@ class ReconciliationEngine:
         if not sales:
             self.warnings.append(f"No sales found for tax year {tax_year}")
             run = self._build_run_summary(tax_year, [], 0, 0)
+            run["data_gap_report"] = self.analyze_data_gaps(tax_year, run)
             self.repo.save_reconciliation_run(run)
             return run
 
@@ -91,6 +93,9 @@ class ReconciliationEngine:
         )
         self.repo.save_reconciliation_run(run)
 
+        # Analyze data gaps
+        run["data_gap_report"] = self.analyze_data_gaps(tax_year, run)
+
         # Audit log
         self.repo.save_audit_entry(AuditEntry(
             timestamp=datetime.now(),
@@ -107,6 +112,142 @@ class ReconciliationEngine:
         ))
 
         return run
+
+    def analyze_data_gaps(self, tax_year: int, run: dict) -> DataGapReport:
+        """Analyze reconciliation warnings/errors and build a structured gap report.
+
+        Groups auto-created lots by ticker, detects zero/suspicious basis,
+        and flags missing Form 3922/3921 from self.errors.
+        """
+        gaps: list[DataGap] = []
+        total_auto = 0
+        total_zero = 0
+        total_missing = 0
+
+        # 1. Group auto-created lot warnings by ticker
+        auto_lots: dict[str, list[str]] = {}
+        for w in self.warnings:
+            if "Auto-created RSU lot for " in w:
+                # Extract ticker from "Auto-created RSU lot for TICK (...)"
+                after = w.split("Auto-created RSU lot for ", 1)[1]
+                ticker = after.split(" ", 1)[0]
+                auto_lots.setdefault(ticker, []).append(w)
+
+        for ticker, warns in auto_lots.items():
+            count = len(warns)
+            total_auto += count
+            # Parse basis and dates from individual warnings
+            total_basis = Decimal("0")
+            dates: list[date] = []
+            for w in warns:
+                if "basis $" in w:
+                    basis_str = w.split("basis $")[1].split(")")[0].replace(",", "")
+                    try:
+                        total_basis += Decimal(basis_str)
+                    except Exception:
+                        pass
+                if "acquired " in w:
+                    date_str = w.split("acquired ")[1].split(",")[0]
+                    try:
+                        dates.append(date.fromisoformat(date_str))
+                    except Exception:
+                        pass
+
+            date_start = min(dates) if dates else None
+            date_end = max(dates) if dates else None
+            year_range = ""
+            if date_start and date_end:
+                year_range = f"{date_start.year}-{date_end.year}" if date_start.year != date_end.year else str(date_start.year)
+
+            gaps.append(DataGap(
+                category=GapCategory.AUTO_CREATED_LOT,
+                severity=GapSeverity.WARNING,
+                ticker=ticker,
+                summary=(
+                    f"{count} RSU lot(s) auto-created from 1099-B data "
+                    f"(basis ${total_basis:,.2f})"
+                ),
+                missing_document=f"Shareworks RSU vest history for {ticker} ({year_range})" if year_range else f"Shareworks RSU vest history for {ticker}",
+                suggested_action="Import Shareworks Equity Award Detail PDF",
+                lot_count=count,
+                total_basis=total_basis,
+                date_range_start=date_start,
+                date_range_end=date_end,
+            ))
+
+        # 2. Detect zero-basis from sale results (pass-through with $0 basis)
+        zero_basis_tickers: dict[str, int] = {}
+        for w in self.warnings:
+            if "basis not reported to IRS" in w or "no broker basis" in w.lower():
+                # Try to extract ticker from "Sale <id> (<name>..."
+                if "(" in w:
+                    name_part = w.split("(")[1].split(" on ")[0] if " on " in w else w.split("(")[1].split(")")[0]
+                    zero_basis_tickers[name_part] = zero_basis_tickers.get(name_part, 0) + 1
+
+        for ticker_name, count in zero_basis_tickers.items():
+            total_zero += count
+            gaps.append(DataGap(
+                category=GapCategory.ZERO_BASIS,
+                severity=GapSeverity.WARNING,
+                ticker=ticker_name,
+                summary=f"{count} sale(s) with basis not reported to IRS",
+                missing_document="Broker cost-basis statement or vest confirmation",
+                suggested_action="Verify basis with broker or import vest records",
+                lot_count=count,
+            ))
+
+        # 3. Detect missing Form 3922 (ESPP) from errors
+        for err in self.errors:
+            if "Form 3922" in err or "ESPP" in err:
+                total_missing += 1
+                ticker = "UNKNOWN"
+                if "(" in err:
+                    ticker = err.split("(")[1].split(" on ")[0] if " on " in err else err.split("(")[1].split(")")[0]
+                gaps.append(DataGap(
+                    category=GapCategory.MISSING_FORM_3922,
+                    severity=GapSeverity.ERROR,
+                    ticker=ticker,
+                    summary="ESPP sale requires Form 3922 data for basis correction",
+                    missing_document=f"Form 3922 (ESPP Transfer of Stock) for {ticker}",
+                    suggested_action="Import Form 3922 PDF or enter ESPP purchase data manually",
+                ))
+
+        # 4. Detect missing Form 3921 (ISO) from errors
+        for err in self.errors:
+            if "Form 3921" in err or ("ISO" in err and "pass-through" in err):
+                total_missing += 1
+                ticker = "UNKNOWN"
+                if "(" in err:
+                    ticker = err.split("(")[1].split(" on ")[0] if " on " in err else err.split("(")[1].split(")")[0]
+                gaps.append(DataGap(
+                    category=GapCategory.MISSING_FORM_3921,
+                    severity=GapSeverity.ERROR,
+                    ticker=ticker,
+                    summary="ISO sale requires Form 3921 data for AMT computation",
+                    missing_document=f"Form 3921 (ISO Exercise) for {ticker}",
+                    suggested_action="Import Form 3921 PDF or enter ISO exercise data manually",
+                ))
+
+        # 5. Detect passthrough sales
+        passthrough_count = run.get("passthrough_sales", 0)
+        if passthrough_count > 0:
+            gaps.append(DataGap(
+                category=GapCategory.PASSTHROUGH_SALE,
+                severity=GapSeverity.INFO,
+                ticker="(various)",
+                summary=(
+                    f"{passthrough_count} sale(s) used broker-reported basis "
+                    f"without lot matching"
+                ),
+                suggested_action="Review pass-through sales to verify basis is correct",
+            ))
+
+        return DataGapReport(
+            gaps=gaps,
+            total_auto_created_lots=total_auto,
+            total_zero_basis_sales=total_zero,
+            total_missing_forms=total_missing,
+        )
 
     def _process_sale(
         self, sale: Sale, lots: list[Lot], events: list[dict]
@@ -290,18 +431,21 @@ class ReconciliationEngine:
     ) -> list[SaleResult] | None:
         """Try to match a sale to a specific ESPP lot using event data.
 
-        For ESPP sales, the broker typically reports FMV at purchase date as
-        the cost basis on 1099-B.  We use FMV (event.price_per_share) to infer
-        shares when shares=0 (manual 1099-B import).
+        For ESPP sales, the broker typically reports the discounted purchase
+        price as the cost basis on 1099-B (purchase_price × shares).  We use
+        the lot's cost_per_share (= purchase price) to infer shares when
+        shares=0 (manual 1099-B import).
 
         Returns list of SaleResult on success, None on failure.
         """
-        fmv_at_purchase = Decimal(event["price_per_share"])
-        if fmv_at_purchase <= 0:
+        # Use purchase price for share inference — brokers report
+        # purchase_price × shares as the 1099-B cost basis for ESPP.
+        reference_price = lot.cost_per_share
+        if reference_price <= 0:
             return None
 
         inferred_shares = self._infer_equity_shares(
-            sale, fmv_at_purchase, lot.shares_remaining
+            sale, reference_price, lot.shares_remaining
         )
         if inferred_shares is None:
             return None

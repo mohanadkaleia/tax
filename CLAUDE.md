@@ -152,8 +152,8 @@ python -m pytest tests/ -v
 # Lint
 ruff check .
 
-# CLI (once implemented)
-python -m app.cli import --source shareworks --file inputs/1099b.csv
+# CLI
+python -m app.cli import inputs/ --year 2025
 python -m app.cli reconcile --year 2025
 python -m app.cli estimate --year 2025
 python -m app.cli strategy --year 2025

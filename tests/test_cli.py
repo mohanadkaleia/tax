@@ -13,8 +13,8 @@ class TestCLI:
         assert result.exit_code == 0
         assert "TaxBot" in result.output
 
-    def test_import_data_help(self):
-        result = runner.invoke(app, ["import-data", "--help"])
+    def test_import_help(self):
+        result = runner.invoke(app, ["import", "--help"])
         assert result.exit_code == 0
 
     def test_reconcile_help(self):

@@ -1,5 +1,6 @@
 """Data models for TaxBot 9000."""
 
+from app.models.data_gaps import DataGap, DataGapReport, GapCategory, GapSeverity
 from app.models.enums import (
     AdjustmentCode,
     BrokerSource,
@@ -33,6 +34,8 @@ __all__ = [
     "AMTWorksheetLine",
     "AuditEntry",
     "BrokerSource",
+    "DataGap",
+    "DataGapReport",
     "DispositionType",
     "EquityEvent",
     "EquityType",
@@ -45,6 +48,8 @@ __all__ = [
     "Form3922",
     "Form8949Category",
     "Form8949Line",
+    "GapCategory",
+    "GapSeverity",
     "HoldingPeriod",
     "Lot",
     "ReconciliationLine",

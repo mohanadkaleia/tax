@@ -232,11 +232,11 @@ class TestESPPPriorityMatch:
         ordinary_income = Decimal(results[0]["ordinary_income"])
         assert ordinary_income > 0, "ESPP ordinary income must be computed"
 
-    def test_espp_shares_inferred_from_fmv(self, repo, engine):
-        """Shares should be inferred using FMV at purchase, not purchase price.
+    def test_espp_shares_inferred_from_purchase_price(self, repo, engine):
+        """Shares should be inferred using purchase price (lot cost_per_share).
 
-        broker_basis=$8,057.40, FMV=$203.05 -> round(8057.40/203.05) = 40 shares
-        If we used purchase_price=$51.65, we'd get round(8057.40/51.65) = 156 shares (WRONG)
+        Brokers report ESPP cost basis as purchase_price × shares on 1099-B.
+        broker_basis=$8,057.40, purchase_price=$51.65 -> round(8057.40/51.65) = 156 shares
         """
         _create_espp_lot(
             repo,
@@ -268,8 +268,8 @@ class TestESPPPriorityMatch:
 
         results = repo.get_sale_results(2024)
         assert len(results) == 1
-        # round(8057.40 / 203.05) = round(39.68) = 40
-        assert Decimal(results[0]["shares"]) == Decimal("40")
+        # round(8057.40 / 51.65) = round(156.0) = 156
+        assert Decimal(results[0]["shares"]) == Decimal("156")
 
     def test_espp_known_shares(self, repo, engine):
         """When sale.shares > 0 (e.g. Robinhood), use that directly."""

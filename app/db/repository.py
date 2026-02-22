@@ -508,3 +508,37 @@ class TaxRepository:
             (event_type, event_date, shares),
         )
         return cursor.fetchone()[0] > 0
+
+    def check_lot_duplicate(
+        self, equity_type: str, ticker: str, acquisition_date: str, shares: str
+    ) -> bool:
+        """Check if a lot with same type/ticker/date/shares already exists."""
+        cursor = self.conn.execute(
+            "SELECT COUNT(*) FROM lots WHERE equity_type = ? AND ticker = ? AND acquisition_date = ? AND shares = ?",
+            (equity_type, ticker, acquisition_date, shares),
+        )
+        return cursor.fetchone()[0] > 0
+
+    def check_sale_duplicate(
+        self, ticker: str, sale_date: str, shares: str, proceeds_per_share: str
+    ) -> bool:
+        """Check if a sale with same ticker/date/shares/proceeds already exists."""
+        cursor = self.conn.execute(
+            "SELECT COUNT(*) FROM sales WHERE ticker = ? AND sale_date = ? AND shares = ? AND proceeds_per_share = ?",
+            (ticker, sale_date, shares, proceeds_per_share),
+        )
+        return cursor.fetchone()[0] > 0
+
+    def check_batch_duplicate(self, file_path: str, tax_year: int | None) -> bool:
+        """Check if a file has already been imported for a given tax year."""
+        if tax_year:
+            cursor = self.conn.execute(
+                "SELECT COUNT(*) FROM import_batches WHERE file_path = ? AND tax_year = ?",
+                (file_path, tax_year),
+            )
+        else:
+            cursor = self.conn.execute(
+                "SELECT COUNT(*) FROM import_batches WHERE file_path = ?",
+                (file_path,),
+            )
+        return cursor.fetchone()[0] > 0

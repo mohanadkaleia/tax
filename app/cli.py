@@ -46,124 +46,49 @@ def main(ctx: typer.Context) -> None:
         raise typer.Exit()
 
 
-@app.command()
-def import_data(
-    source: str = typer.Argument(..., help="Data source: manual, shareworks, robinhood"),
-    file: Path = typer.Argument(..., help="Path to data file (JSON for manual, PDF for shareworks, CSV for robinhood)"),
-    year: int | None = typer.Option(
-        None,
-        "--year",
-        "-y",
-        help="Tax year (overrides value from JSON if provided)",
-    ),
-    db: Path = typer.Option(
-        Path.home() / ".taxbot" / "taxbot.db",
-        "--db",
-        help="Path to the SQLite database file",
-    ),
-) -> None:
-    """Import parsed tax data (JSON) into the TaxBot database."""
-    # Validate file exists and is JSON
-    if not file.exists():
-        typer.echo(f"Error: File not found: {file}", err=True)
-        raise typer.Exit(1)
-    # Validate source
-    valid_sources = {"manual", "shareworks", "robinhood"}
-    if source.lower() not in valid_sources:
-        typer.echo(
-            f"Error: Unknown source '{source}'. Valid sources: {', '.join(sorted(valid_sources))}",
-            err=True,
-        )
-        raise typer.Exit(1)
-
-    # Validate file extension based on source
-    if source.lower() == "shareworks":
-        if file.suffix.lower() != ".pdf":
-            typer.echo(f"Error: Shareworks source expects a PDF file: {file}", err=True)
-            raise typer.Exit(1)
-    elif source.lower() == "robinhood":
-        if file.suffix.lower() != ".csv":
-            typer.echo(f"Error: Robinhood source expects a CSV file: {file}", err=True)
-            raise typer.Exit(1)
-    elif file.suffix.lower() != ".json":
-        typer.echo(f"Error: File must be JSON: {file}", err=True)
-        raise typer.Exit(1)
-
-    from app.db.repository import TaxRepository
-    from app.db.schema import create_schema
+def _save_import_result(
+    result: Any,
+    source: str,
+    file_path: Path,
+    repo: Any,
+) -> dict:
+    """Save a parsed ImportResult to the database. Returns a summary dict."""
     from app.models.tax_forms import W2, Form1099DIV, Form1099INT
 
-    # Select adapter by source
-    if source.lower() == "shareworks":
-        from app.ingestion.shareworks import ShareworksAdapter
-        adapter = ShareworksAdapter()
-    elif source.lower() == "robinhood":
-        from app.ingestion.robinhood import RobinhoodAdapter
-        adapter = RobinhoodAdapter()
-    else:
-        from app.ingestion.manual import ManualAdapter
-        adapter = ManualAdapter()
-
-    try:
-        result = adapter.parse(file)
-    except (ValueError, KeyError, FileNotFoundError) as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(1)
-
-    # Override tax year if specified
-    if year:
-        result.tax_year = year
-        for form in result.forms:
-            form.tax_year = year
-        for event in result.events:
-            pass  # Events don't have tax_year; date is enough
-
-    # Validate
-    errors = adapter.validate(result)
-    if errors:
-        typer.echo("Validation errors:", err=True)
-        for error in errors:
-            typer.echo(f"  - {error}", err=True)
-        raise typer.Exit(1)
-
-    # Initialize database
-    db.parent.mkdir(parents=True, exist_ok=True)
-    conn = create_schema(db)
-    repo = TaxRepository(conn)
-
-    # Check for duplicates
-    duplicates_found = False
+    # Duplicate warnings (non-blocking)
     for form in result.forms:
         if isinstance(form, W2) and repo.check_w2_duplicate(form.employer_name, form.tax_year):
             typer.echo(
                 f"Warning: W-2 from {form.employer_name} ({form.tax_year}) already imported",
                 err=True,
             )
-            duplicates_found = True
-    for event in result.events:
-        if repo.check_event_duplicate(
-            event.event_type.value,
-            event.event_date.isoformat(),
-            str(event.shares),
-        ):
-            typer.echo(
-                f"Warning: {event.event_type.value} event on {event.event_date} "
-                f"({event.shares} shares) may be a duplicate",
-                err=True,
-            )
-            duplicates_found = True
+    # Batch-level re-import protection
+    if repo.check_batch_duplicate(str(file_path), result.tax_year):
+        typer.echo(
+            f"Warning: {file_path.name} already imported for tax year {result.tax_year}. Skipping.",
+            err=True,
+        )
+        return {
+            "source": source,
+            "file": file_path.name,
+            "form_type": result.form_type.value,
+            "forms": 0,
+            "events": 0,
+            "lots": 0,
+            "sales": 0,
+            "skipped": True,
+            "reason": "duplicate_batch",
+        }
 
-    # Create import batch
     record_count = len(result.forms) + len(result.events) + len(result.sales)
     batch_id = repo.create_import_batch(
         source=source,
         tax_year=result.tax_year,
-        file_path=str(file),
+        file_path=str(file_path),
         form_type=result.form_type.value,
         record_count=record_count,
     )
 
-    # Save all data to database
     for form in result.forms:
         if isinstance(form, W2):
             repo.save_w2(form, batch_id)
@@ -171,50 +96,388 @@ def import_data(
             repo.save_1099div(form, batch_id)
         elif isinstance(form, Form1099INT):
             repo.save_1099int(form, batch_id)
-
+    skipped_events = 0
     for event in result.events:
+        if repo.check_event_duplicate(
+            event.event_type.value,
+            event.event_date.isoformat(),
+            str(event.shares),
+        ):
+            typer.echo(
+                f"Warning: Duplicate event skipped: {event.event_type.value} "
+                f"{event.event_date} ({event.shares} shares)",
+                err=True,
+            )
+            skipped_events += 1
+            continue
         repo.save_event(event, batch_id)
-
+    skipped_lots = 0
     for lot in result.lots:
+        if repo.check_lot_duplicate(
+            lot.equity_type.value,
+            lot.security.ticker,
+            lot.acquisition_date.isoformat(),
+            str(lot.shares),
+        ):
+            typer.echo(
+                f"Warning: Duplicate lot skipped: {lot.equity_type.value} "
+                f"{lot.acquisition_date} ({lot.shares} shares)",
+                err=True,
+            )
+            skipped_lots += 1
+            continue
         repo.save_lot(lot, batch_id)
 
+    skipped_sales = 0
     for sale in result.sales:
+        if repo.check_sale_duplicate(
+            sale.security.ticker,
+            sale.sale_date.isoformat(),
+            str(sale.shares),
+            str(sale.proceeds_per_share),
+        ):
+            typer.echo(
+                f"Warning: Duplicate sale skipped: {sale.security.ticker} "
+                f"{sale.sale_date} ({sale.shares} shares)",
+                err=True,
+            )
+            skipped_sales += 1
+            continue
         repo.save_sale(sale, batch_id)
+
+    return {
+        "source": source,
+        "file": file_path.name,
+        "form_type": result.form_type.value,
+        "forms": len(result.forms),
+        "events": len(result.events),
+        "lots": len(result.lots),
+        "sales": len(result.sales) - skipped_sales,
+        "skipped_sales": skipped_sales,
+    }
+
+
+def _process_pdf(file_path: Path, year: int, repo: Any) -> dict:
+    """Parse a PDF tax form and import the result. Returns a summary dict."""
+    import os
+    import tempfile
+
+    import pdfplumber
+
+    from app.parsing.detector import detect_form_type
+    from app.parsing.extractors import get_extractor
+    from app.parsing.redactor import Redactor
+
+    # 1. Extract text + tables from PDF
+    all_text = ""
+    all_tables: list[list[list[str]]] = []
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text() or ""
+            all_text += page_text + "\n"
+            page_tables = page.extract_tables() or []
+            all_tables.extend(page_tables)
+
+    # 2. Vision fallback if no text and API key available
+    used_vision = False
+    if not all_text.strip() and os.environ.get("ANTHROPIC_API_KEY"):
+        from app.parsing.vision import VisionExtractor
+
+        typer.echo(f"  {file_path.name}: No text found, using Vision API...", err=True)
+        extractor_v = VisionExtractor()
+        images = extractor_v.pdf_to_images(file_path)
+        detected_type = extractor_v.detect_form_type(images)
+        if detected_type is None:
+            raise ValueError(f"Could not detect form type in {file_path.name}")
+        data = extractor_v.extract(images, detected_type)
+        used_vision = True
+    elif not all_text.strip():
+        raise ValueError(
+            f"No text found in {file_path.name} (scanned PDF). "
+            "Set ANTHROPIC_API_KEY to use Vision extraction."
+        )
+    else:
+        detected_type = None
+        data = None
+
+    # 3. Text-based extraction path
+    if not used_vision:
+        redactor = Redactor()
+        redaction_result = redactor.redact(all_text)
+        redacted_text = redaction_result.text
+
+        detected_type = detect_form_type(redacted_text)
+
+        # Fallback to Vision if text detection fails
+        if detected_type is None:
+            if os.environ.get("ANTHROPIC_API_KEY"):
+                from app.parsing.vision import VisionExtractor
+
+                extractor_v = VisionExtractor()
+                images = extractor_v.pdf_to_images(file_path)
+                detected_type = extractor_v.detect_form_type(images)
+                used_vision = True
+            if detected_type is None:
+                raise ValueError(f"Could not detect form type in {file_path.name}")
+
+        if used_vision:
+            data = extractor_v.extract(images, detected_type)
+        else:
+            extractor = get_extractor(detected_type)
+            data = extractor.extract(redacted_text, all_tables)
+
+            # Fallback to Vision if regex extraction returned empty
+            if (isinstance(data, list) and len(data) == 0) or (isinstance(data, dict) and not data):
+                if os.environ.get("ANTHROPIC_API_KEY"):
+                    from app.parsing.vision import VisionExtractor
+
+                    extractor_v = VisionExtractor()
+                    images = extractor_v.pdf_to_images(file_path)
+                    data = extractor_v.extract(images, detected_type)
+                    used_vision = True
+
+    # 4. Validate extraction
+    regex_extractor = get_extractor(detected_type)
+    errors = regex_extractor.validate_extraction(data)
+    if errors:
+        raise ValueError(
+            f"Extraction errors in {file_path.name}: " + "; ".join(errors)
+        )
+
+    # 5. Scrub PII from output
+    if not used_vision:
+        redactor = Redactor()
+    else:
+        from app.parsing.redactor import Redactor
+        redactor = Redactor()
+    if isinstance(data, dict):
+        data = redactor.scrub_output(data)
+    elif isinstance(data, list):
+        data = [redactor.scrub_output(record) for record in data]
+
+    # 6. Set tax year on all records
+    if isinstance(data, list):
+        for record in data:
+            record["tax_year"] = year
+    else:
+        data["tax_year"] = year
+
+    # 7. Write temp JSON → import via ManualAdapter
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False,
+    ) as tmp:
+        json.dump(data, tmp, default=str)
+        tmp_path = Path(tmp.name)
+
+    try:
+        from app.ingestion.manual import ManualAdapter
+
+        adapter = ManualAdapter()
+        result = adapter.parse(tmp_path)
+        result.tax_year = year
+        for form in result.forms:
+            form.tax_year = year
+        val_errors = adapter.validate(result)
+        if val_errors:
+            raise ValueError(
+                f"Validation errors in {file_path.name}: " + "; ".join(val_errors)
+            )
+        summary = _save_import_result(result, "pdf", file_path, repo)
+        summary["form_type"] = detected_type.value
+        return summary
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _process_csv(file_path: Path, year: int, repo: Any) -> dict:
+    """Parse a CSV file via RobinhoodAdapter and import. Returns a summary dict."""
+    from app.ingestion.robinhood import RobinhoodAdapter
+
+    adapter = RobinhoodAdapter()
+    result = adapter.parse(file_path)
+    result.tax_year = year
+    for form in result.forms:
+        form.tax_year = year
+    errors = adapter.validate(result)
+    if errors:
+        raise ValueError(
+            f"Validation errors in {file_path.name}: " + "; ".join(errors)
+        )
+    return _save_import_result(result, "robinhood", file_path, repo)
+
+
+def _process_json(file_path: Path, year: int, repo: Any) -> dict:
+    """Parse a JSON file via ManualAdapter and import. Returns a summary dict."""
+    from app.ingestion.manual import ManualAdapter
+
+    adapter = ManualAdapter()
+    result = adapter.parse(file_path)
+    result.tax_year = year
+    for form in result.forms:
+        form.tax_year = year
+    errors = adapter.validate(result)
+    if errors:
+        raise ValueError(
+            f"Validation errors in {file_path.name}: " + "; ".join(errors)
+        )
+    return _save_import_result(result, "manual", file_path, repo)
+
+
+def _print_import_summary(results: list[dict], errors: list[tuple[str, str]], db_path: Path, year: int) -> None:
+    """Print the import summary table."""
+    typer.echo("")
+    typer.echo("=== Import Summary ===")
+    typer.echo("")
+    header = (
+        f"  {'#':>3} | {'File':<30} | {'Type':<8}"
+        f" | {'Forms':>5} | {'Events':>6} | {'Lots':>4} | {'Sales':>5} | Status"
+    )
+    typer.echo(header)
+    sep = f" {'-'*4}|{'-'*32}|{'-'*10}|{'-'*7}|{'-'*8}|{'-'*6}|{'-'*7}|{'-'*8}"
+    typer.echo(sep)
+
+    idx = 0
+    all_entries = []
+
+    for r in results:
+        idx += 1
+        all_entries.append((
+            idx, r["file"], r.get("form_type", "--"),
+            r["forms"], r["events"], r["lots"], r["sales"], "OK",
+        ))
+
+    for fname, _ in errors:
+        idx += 1
+        all_entries.append((idx, fname, "--", "--", "--", "--", "--", "ERROR"))
+
+    for entry in sorted(all_entries, key=lambda x: x[0]):
+        i, fname, ftype, forms, events, lots, sales, status = entry
+        line = (
+            f"  {i:>3} | {fname:<30} | {ftype:<8}"
+            f" | {str(forms):>5} | {str(events):>6}"
+            f" | {str(lots):>4} | {str(sales):>5} | {status}"
+        )
+        typer.echo(line)
+
+    total = len(results) + len(errors)
+    typer.echo("")
+    typer.echo(f"Imported {len(results)} of {total} file(s) into {db_path.name} (tax year {year})")
+
+
+@app.command(name="import")
+def import_cmd(
+    directory: Path = typer.Argument(..., help="Directory containing tax documents (.pdf, .csv, .json)"),
+    year: int = typer.Option(
+        ...,
+        "--year",
+        "-y",
+        help="Tax year for import",
+    ),
+    db: Path = typer.Option(
+        Path.home() / ".taxbot" / "taxbot.db",
+        "--db",
+        help="Path to the SQLite database file",
+    ),
+) -> None:
+    """Import tax documents from a directory into the TaxBot database.
+
+    Scans the directory for .pdf, .csv, and .json files, auto-detects
+    file types, parses them, and imports into the database.
+    """
+    if not directory.exists() or not directory.is_dir():
+        typer.echo(f"Error: Directory not found: {directory}", err=True)
+        raise typer.Exit(1)
+
+    # Collect files sorted by name
+    supported_exts = {".pdf", ".csv", ".json"}
+    files = sorted(
+        [f for f in directory.iterdir() if f.is_file() and f.suffix.lower() in supported_exts],
+        key=lambda f: f.name,
+    )
+
+    if not files:
+        typer.echo(f"No .pdf, .csv, or .json files found in {directory}")
+        raise typer.Exit(0)
+
+    from app.db.repository import TaxRepository
+    from app.db.schema import create_schema
+
+    # Initialize database
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = create_schema(db)
+    repo = TaxRepository(conn)
+
+    results: list[dict] = []
+    errors: list[tuple[str, str]] = []
+
+    for file_path in files:
+        ext = file_path.suffix.lower()
+        try:
+            if ext == ".pdf":
+                summary = _process_pdf(file_path, year, repo)
+            elif ext == ".csv":
+                summary = _process_csv(file_path, year, repo)
+            elif ext == ".json":
+                summary = _process_json(file_path, year, repo)
+            else:
+                continue
+            results.append(summary)
+        except Exception as exc:
+            typer.echo(f"Error processing {file_path.name}: {exc}", err=True)
+            errors.append((file_path.name, str(exc)))
 
     conn.close()
 
-    # Print summary
-    form_type_label = result.form_type.value.upper()
-    form_count = len(result.forms)
-    event_count = len(result.events)
-    lot_count = len(result.lots)
-    sale_count = len(result.sales)
+    _print_import_summary(results, errors, db, year)
 
-    # Build a descriptive summary
-    summary_parts = []
-    if form_count:
-        # Try to get a name from the first form for a nice message
-        first = result.forms[0]
-        name = (
-            getattr(first, "employer_name", None)
-            or getattr(first, "broker_name", None)
-            or getattr(first, "payer_name", None)
-            or ""
+    if errors:
+        raise typer.Exit(1)
+
+
+def _print_data_gaps(run: dict) -> None:
+    """Render the structured data gap analysis from a reconciliation run."""
+    from app.models.data_gaps import DataGapReport, GapSeverity
+
+    gap_report: DataGapReport | None = run.get("data_gap_report")
+    if gap_report is None:
+        return
+
+    typer.echo("")
+    typer.echo("=== Data Gap Analysis ===")
+    typer.echo("")
+
+    if not gap_report.gaps:
+        typer.echo("No data gaps detected. All sales matched to imported lots.")
+        return
+
+    severity_icons = {
+        GapSeverity.ERROR: "[!!]",
+        GapSeverity.WARNING: "[!]",
+        GapSeverity.INFO: "[i]",
+    }
+
+    for gap in gap_report.gaps:
+        icon = severity_icons.get(gap.severity, "[?]")
+        typer.echo(f"  {icon} {gap.ticker}: {gap.summary}")
+
+        if gap.date_range_start and gap.date_range_end:
+            typer.echo(
+                f"      Vest dates: {gap.date_range_start.isoformat()} "
+                f"to {gap.date_range_end.isoformat()}"
+            )
+
+        if gap.missing_document:
+            typer.echo(f"      Missing: {gap.missing_document}")
+
+        if gap.suggested_action:
+            typer.echo(f"      -> {gap.suggested_action}")
+
+        typer.echo("")
+
+    if gap_report.has_blocking_gaps:
+        typer.echo(
+            "  Some gaps have ERROR severity and may affect tax accuracy."
         )
-        label = f"{form_count} {form_type_label}"
-        if name:
-            label += f" from {name}"
-        summary_parts.append(label)
-    if event_count:
-        summary_parts.append(f"{event_count} event(s)")
-    if lot_count:
-        summary_parts.append(f"{lot_count} lot(s)")
-    if sale_count:
-        summary_parts.append(f"{sale_count} sale(s)")
-
-    typer.echo(f"Imported {', '.join(summary_parts)} (tax year {result.tax_year})")
-    if duplicates_found:
-        typer.echo("Note: Some records may be duplicates of previously imported data.")
 
 
 @app.command()
@@ -225,14 +488,22 @@ def reconcile(
         "--db",
         help="Path to the SQLite database file",
     ),
+    no_prompt: bool = typer.Option(
+        False,
+        "--no-prompt",
+        "--batch",
+        help="Skip interactive prompts (batch mode)",
+    ),
 ) -> None:
     """Run basis correction and reconciliation for a tax year."""
+    import sys
+
     from app.db.repository import TaxRepository
     from app.db.schema import create_schema
     from app.engines.reconciliation import ReconciliationEngine
 
     if not db.exists():
-        typer.echo("Error: No database found. Import data first with `taxbot import-data`.", err=True)
+        typer.echo("Error: No database found. Import data first with `taxbot import`.", err=True)
         raise typer.Exit(1)
 
     conn = create_schema(db)
@@ -268,9 +539,18 @@ def reconcile(
     if amt and amt != "0":
         typer.echo(f"  AMT adjustment:  ${_fmt(amt)}")
 
-    if run.get("warnings"):
+    # Data gap analysis (replaces raw warnings for auto-created lots)
+    _print_data_gaps(run)
+
+    # Still show non-auto-created warnings
+    other_warnings = [
+        w for w in (run.get("warnings") or [])
+        if "Auto-created RSU lot for " not in w
+        and "date_acquired is 'Various'" not in w
+    ]
+    if other_warnings:
         typer.echo("\nWarnings:")
-        for w in run["warnings"]:
+        for w in other_warnings:
             typer.echo(f"  - {w}")
 
     if run.get("errors"):
@@ -279,6 +559,36 @@ def reconcile(
             typer.echo(f"  - {e}")
 
     typer.echo(f"\nStatus: {run['status']}")
+
+    # Interactive prompt when gaps exist and not in batch mode
+    gap_report = run.get("data_gap_report")
+    if (
+        gap_report
+        and gap_report.gaps
+        and not no_prompt
+        and sys.stdin.isatty()
+    ):
+        typer.echo("")
+        typer.echo("Options:")
+        typer.echo("  [1] Continue anyway")
+        typer.echo("  [2] Show detailed lot list")
+        typer.echo("  [3] Exit to import missing documents")
+        choice = typer.prompt("Select", default="1")
+        if choice == "2":
+            # Show the raw auto-created lot warnings
+            auto_warnings = [
+                w for w in (run.get("warnings") or [])
+                if "Auto-created RSU lot for " in w
+            ]
+            if auto_warnings:
+                typer.echo("\nDetailed auto-created lots:")
+                for w in auto_warnings:
+                    typer.echo(f"  - {w}")
+            else:
+                typer.echo("\nNo detailed lot data to display.")
+        elif choice == "3":
+            typer.echo("\nExiting. Import missing documents and re-run reconciliation.")
+            raise typer.Exit(0)
 
 
 @app.command()
@@ -388,7 +698,7 @@ def estimate(
         raise typer.Exit(1)
 
     if not db.exists():
-        typer.echo("Error: No database found. Import data first with `taxbot import-data`.", err=True)
+        typer.echo("Error: No database found. Import data first with `taxbot import`.", err=True)
         raise typer.Exit(1)
 
     conn = create_schema(db)
@@ -628,7 +938,7 @@ def strategy(
         raise typer.Exit(1)
 
     if not db.exists():
-        typer.echo("Error: No database found. Import data first with `taxbot import-data`.", err=True)
+        typer.echo("Error: No database found. Import data first with `taxbot import`.", err=True)
         raise typer.Exit(1)
 
     conn = create_schema(db)
@@ -800,7 +1110,7 @@ def report(
         raise typer.Exit(1)
 
     if not db.exists():
-        typer.echo("Error: No database found. Import data first with `taxbot import-data`.", err=True)
+        typer.echo("Error: No database found. Import data first with `taxbot import`.", err=True)
         raise typer.Exit(1)
 
     conn = create_schema(db)
@@ -1200,7 +1510,7 @@ def add_lot(
 
     typer.echo(f"Added {equity_type.upper()} lot: {shares} {ticker.upper()} shares at ${cost_per_share}/share ({acquisition_date})")
     typer.echo(f"Output: {out_path}")
-    typer.echo(f"Import with: python -m app.cli import-data manual {out_path}")
+    typer.echo(f"Import with: python -m app.cli import {out_path.parent} --year {acq_date.year}")
 
 
 class _DecimalEncoder(json.JSONEncoder):
@@ -1210,285 +1520,6 @@ class _DecimalEncoder(json.JSONEncoder):
         if isinstance(obj, Decimal):
             return str(obj)
         return super().default(obj)
-
-
-@app.command()
-def parse(
-    file: Path = typer.Argument(..., help="Path to the PDF tax form"),
-    form_type: str | None = typer.Option(
-        None,
-        "--form-type",
-        "-t",
-        help="Form type: w2, 1099b, 1099div, 1099int, 3921, 3922 (auto-detected if omitted)",
-    ),
-    year: int | None = typer.Option(
-        None,
-        "--year",
-        "-y",
-        help="Tax year (auto-detected from form if omitted)",
-    ),
-    output: Path = typer.Option(
-        Path("inputs/"),
-        "--output",
-        "-o",
-        help="Output directory for the generated JSON file",
-    ),
-    dry_run: bool = typer.Option(
-        False,
-        "--dry-run",
-        help="Print extracted data to stdout without writing a file",
-    ),
-    vision: bool = typer.Option(
-        False,
-        "--vision",
-        help="Use Claude Vision API for scanned/image-based PDFs (requires anthropic SDK)",
-    ),
-) -> None:
-    """Parse a PDF tax form into JSON for import."""
-    # Validate file exists and is PDF
-    if not file.exists():
-        typer.echo(f"Error: File not found: {file}", err=True)
-        raise typer.Exit(1)
-    if file.suffix.lower() != ".pdf":
-        typer.echo(f"Error: File must be a PDF: {file}", err=True)
-        raise typer.Exit(1)
-
-    try:
-        import pdfplumber
-    except ImportError:
-        typer.echo("Error: pdfplumber is not installed. Run: pip install pdfplumber", err=True)
-        raise typer.Exit(1)
-
-    from app.exceptions import ExtractionError, FormDetectionError, VisionExtractionError
-    from app.parsing.detector import FormType, detect_form_type
-    from app.parsing.extractors import get_extractor
-    from app.parsing.redactor import Redactor
-
-    # Extract text and tables from PDF (read-only, never copied)
-    all_text = ""
-    all_tables: list[list[list[str]]] = []
-    try:
-        with pdfplumber.open(file) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text() or ""
-                all_text += page_text + "\n"
-                page_tables = page.extract_tables() or []
-                all_tables.extend(page_tables)
-    except Exception as exc:
-        typer.echo(f"Error: Could not read PDF: {exc}", err=True)
-        raise typer.Exit(1)
-
-    # Determine whether to use vision extraction
-    use_vision = vision
-    has_text = bool(all_text.strip())
-
-    # Auto-fallback: if no text found, use vision if API key available
-    if not has_text and not vision:
-        import os
-        if os.environ.get("ANTHROPIC_API_KEY"):
-            typer.echo(
-                "No text found in PDF (likely scanned/image-based). Using Claude Vision API...",
-                err=True,
-            )
-            use_vision = True
-        else:
-            typer.echo(
-                "Error: No text found in PDF (likely scanned/image-based). "
-                "Set ANTHROPIC_API_KEY or use --vision to extract with Claude Vision API.",
-                err=True,
-            )
-            raise typer.Exit(1)
-
-    # --- Vision extraction path ---
-    if use_vision:
-        try:
-            from app.parsing.vision import VisionExtractor
-        except ImportError:
-            typer.echo(
-                "Error: anthropic package not installed. Run: pip install anthropic",
-                err=True,
-            )
-            raise typer.Exit(1)
-
-        typer.echo("Extracting with Claude Vision API...")
-        try:
-            extractor_v = VisionExtractor()
-            images = extractor_v.pdf_to_images(file)
-            typer.echo(f"  Converted {len(images)} page(s) to images")
-
-            # Detect or validate form type via vision
-            detected_type: FormType | None = None
-            if form_type:
-                try:
-                    detected_type = FormType(form_type.lower())
-                except ValueError:
-                    valid = ", ".join(ft.value for ft in FormType)
-                    typer.echo(f"Error: Unknown form type '{form_type}'. Valid types: {valid}", err=True)
-                    raise typer.Exit(1)
-            else:
-                detected_type = extractor_v.detect_form_type(images)
-                if detected_type is None:
-                    raise FormDetectionError(str(file))
-
-            typer.echo(f"Detected form type: {detected_type.value}")
-
-            max_tokens = max(4096, len(images) * 2048)
-            typer.echo(f"  Sending {len(images)} page(s) to Claude Vision (max_tokens={max_tokens})...")
-            data = extractor_v.extract(images, detected_type)
-        except VisionExtractionError as exc:
-            typer.echo(f"Error: {exc}", err=True)
-            raise typer.Exit(1)
-
-        # Override tax year if specified
-        if year:
-            if isinstance(data, list):
-                for record in data:
-                    record["tax_year"] = year
-            else:
-                data["tax_year"] = year
-
-        # Validate and warn using the regex extractor's logic (shared validation)
-        regex_extractor = get_extractor(detected_type)
-        errors = regex_extractor.validate_extraction(data)
-        if errors:
-            typer.echo("Extraction errors:", err=True)
-            for error in errors:
-                typer.echo(f"  - {error}", err=True)
-            raise ExtractionError(str(file), errors)
-
-        warnings = regex_extractor.get_warnings(data)
-        if warnings:
-            typer.echo("Plausibility warnings (review output for accuracy):", err=True)
-            for warning in warnings:
-                typer.echo(f"  ⚠ {warning}", err=True)
-
-        # Scrub PII from output (layer 2 — prompt already instructed null for PII)
-        redactor = Redactor()
-        if isinstance(data, dict):
-            data = redactor.scrub_output(data)
-        elif isinstance(data, list):
-            data = [redactor.scrub_output(record) for record in data]
-
-        # Serialize and output
-        json_output = json.dumps(data, indent=2, cls=_DecimalEncoder)
-
-        if dry_run:
-            typer.echo(json_output)
-        else:
-            output.mkdir(parents=True, exist_ok=True)
-            file_year = year
-            if not file_year:
-                if isinstance(data, list) and data:
-                    file_year = data[0].get("tax_year")
-                elif isinstance(data, dict):
-                    file_year = data.get("tax_year")
-            file_year = file_year or "unknown"
-
-            base_name = f"{detected_type.value}_{file_year}"
-            out_path = output / f"{base_name}.json"
-            counter = 2
-            while out_path.exists():
-                out_path = output / f"{base_name}_{counter}.json"
-                counter += 1
-
-            out_path.write_text(json_output)
-            typer.echo(f"Output written to: {out_path}")
-
-        record_count = len(data) if isinstance(data, list) else 1
-        typer.echo(f"Extracted {record_count} record(s) from {detected_type.value} (vision)")
-        return
-
-    # --- Text/regex extraction path (digital PDF with text layer) ---
-    # Redact PII from raw text
-    redactor = Redactor()
-    redaction_result = redactor.redact(all_text)
-    redacted_text = redaction_result.text
-
-    # Detect or validate form type
-    detected_type = None
-    if form_type:
-        try:
-            detected_type = FormType(form_type.lower())
-        except ValueError:
-            valid = ", ".join(ft.value for ft in FormType)
-            typer.echo(f"Error: Unknown form type '{form_type}'. Valid types: {valid}", err=True)
-            raise typer.Exit(1)
-    else:
-        detected_type = detect_form_type(redacted_text)
-        if detected_type is None:
-            raise FormDetectionError(str(file))
-
-    typer.echo(f"Detected form type: {detected_type.value}")
-
-    # Extract fields
-    extractor = get_extractor(detected_type)
-    data = extractor.extract(redacted_text, all_tables)
-
-    # Override tax year if specified
-    if year:
-        if isinstance(data, list):
-            for record in data:
-                record["tax_year"] = year
-        else:
-            data["tax_year"] = year
-
-    # Validate extraction (hard errors = missing required fields)
-    errors = extractor.validate_extraction(data)
-    if errors:
-        typer.echo("Extraction errors:", err=True)
-        for error in errors:
-            typer.echo(f"  - {error}", err=True)
-        raise ExtractionError(str(file), errors)
-
-    # Plausibility warnings (non-blocking — output still generated)
-    warnings = extractor.get_warnings(data)
-    if warnings:
-        typer.echo("Plausibility warnings (review output for accuracy):", err=True)
-        for warning in warnings:
-            typer.echo(f"  ⚠ {warning}", err=True)
-
-    # Scrub PII from output
-    if isinstance(data, dict):
-        data = redactor.scrub_output(data)
-    elif isinstance(data, list):
-        data = [redactor.scrub_output(record) for record in data]
-
-    # Serialize to JSON
-    json_output = json.dumps(data, indent=2, cls=_DecimalEncoder)
-
-    if dry_run:
-        typer.echo(json_output)
-    else:
-        # Ensure output directory exists
-        output.mkdir(parents=True, exist_ok=True)
-
-        # Determine tax year for filename
-        file_year = year
-        if not file_year:
-            if isinstance(data, list) and data:
-                file_year = data[0].get("tax_year")
-            elif isinstance(data, dict):
-                file_year = data.get("tax_year")
-        file_year = file_year or "unknown"
-
-        # Generate output filename (avoid overwriting)
-        base_name = f"{detected_type.value}_{file_year}"
-        out_path = output / f"{base_name}.json"
-        counter = 2
-        while out_path.exists():
-            out_path = output / f"{base_name}_{counter}.json"
-            counter += 1
-
-        out_path.write_text(json_output)
-        typer.echo(f"Output written to: {out_path}")
-
-    # Print summary
-    record_count = len(data) if isinstance(data, list) else 1
-    typer.echo(f"Extracted {record_count} record(s) from {detected_type.value}")
-    if redaction_result.redactions_made:
-        typer.echo("PII redacted:")
-        for note in redaction_result.redactions_made:
-            typer.echo(f"  - {note}")
 
 
 @app.command()
@@ -1552,20 +1583,6 @@ def chat(
     console = Console()
 
     run_chat(console, client, model, system_prompt)
-
-
-@app.command()
-def wizard(
-    db: Path = typer.Option(
-        Path.home() / ".taxbot" / "taxbot.db",
-        "--db",
-        help="Path to the SQLite database file",
-    ),
-) -> None:
-    """Interactive step-by-step tax processing wizard."""
-    from app.wizard import run_wizard
-
-    run_wizard(db)
 
 
 if __name__ == "__main__":
