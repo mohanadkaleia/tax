@@ -20,14 +20,17 @@ FORM_DETECTION_PROMPT = """Look at these tax document page(s) and identify the f
 Return JSON in this exact format:
 {"form_type": "<type>"}
 
-Where <type> is one of: "w2", "1099b", "1099div", "1099int", "3921", "3922", "shareworks_rsu_release"
+Where <type> is one of: "w2", "1099b", "1099div", "1099int", "3921", "3922", "shareworks_rsu_release", "robinhood_consolidated"
 
 If you see a Shareworks "Releases Report" or "RSU Vest Details" document with columns like
 "Release Price (Cost Basis)", "Vest Date", "Vested", "Withheld for Taxes", return "shareworks_rsu_release".
 
-IMPORTANT: This may be a COMPOSITE brokerage statement (e.g., from Robinhood, Morgan Stanley,
-Schwab, Fidelity) that contains multiple form types (1099-B, 1099-DIV, 1099-INT) in one document.
-If you see a composite/consolidated tax statement:
+IMPORTANT: If you see a consolidated tax document from Robinhood Securities LLC that contains
+a "Summary Information" section with multiple form types (1099-DIV, 1099-INT, 1099-B), return
+"robinhood_consolidated". This is a single document that combines all 1099 forms.
+
+For other composite brokerage statements (e.g., from Morgan Stanley, Schwab, Fidelity)
+that contain multiple form types (1099-B, 1099-DIV, 1099-INT) in one document:
 - If it contains 1099-B transaction data (proceeds, sales), return "1099b"
 - If it only contains dividend data, return "1099div"
 - If it only contains interest data, return "1099int"
@@ -260,6 +263,65 @@ Notes:
 - shares_vested, shares_withheld, shares_sold, shares_net are integers.
 """
 
+ROBINHOOD_CONSOLIDATED_PROMPT = """Extract all tax data from this Robinhood consolidated 1099 document.
+
+This is a single PDF from Robinhood Securities LLC containing 1099-DIV, 1099-INT, and possibly 1099-B data.
+Look at the "Summary Information" section and extract data for each sub-form present.
+
+Return JSON in this exact format:
+{
+  "consolidated": true,
+  "payer_name": "Robinhood Securities LLC",
+  "tax_year": 2025,
+  "form_1099div": {
+    "tax_year": 2025,
+    "payer_name": "Robinhood Securities LLC",
+    "ordinary_dividends": "3475.63",
+    "qualified_dividends": "2891.45",
+    "capital_gain_distributions": "0.00",
+    "nondividend_distributions": "0.00",
+    "section_199a_dividends": "0.00",
+    "foreign_tax_paid": "0.00",
+    "foreign_country": null,
+    "federal_tax_withheld": "0.00",
+    "state_tax_withheld": "0.00"
+  },
+  "form_1099int": {
+    "tax_year": 2025,
+    "payer_name": "Robinhood Securities LLC",
+    "interest_income": "610.38",
+    "us_savings_bond_interest": "0.00",
+    "early_withdrawal_penalty": "0.00",
+    "federal_tax_withheld": "0.00",
+    "state_tax_withheld": "0.00"
+  },
+  "form_1099b": [
+    {
+      "tax_year": 2025,
+      "broker_name": "Robinhood",
+      "broker_source": "MANUAL",
+      "description": "100 sh AAPL",
+      "date_acquired": "2024-01-15",
+      "date_sold": "2025-06-20",
+      "proceeds": "15000.00",
+      "cost_basis": "12000.00",
+      "wash_sale_loss_disallowed": null,
+      "basis_reported_to_irs": true
+    }
+  ]
+}
+
+Notes:
+- Include "form_1099div" ONLY if dividend data is present. Map Robinhood's "1a-" to ordinary_dividends, "1b-" to qualified_dividends, etc.
+- Include "form_1099int" ONLY if interest data is present. Map Robinhood's "1-" to interest_income, etc.
+- Include "form_1099b" ONLY if there are actual brokerage transactions with non-zero proceeds.
+  If the 1099-B section shows all zeros or "No transactions", omit form_1099b entirely.
+- For 1099-B records, extract EVERY individual transaction (not summaries/totals).
+- All monetary values as strings with exactly 2 decimal places.
+- All dates in ISO format: YYYY-MM-DD.
+- Set missing values to "0.00" for monetary fields or null for non-monetary fields.
+"""
+
 FORM_PROMPTS: dict[FormType, str] = {
     FormType.W2: W2_PROMPT,
     FormType.FORM_1099B: FORM_1099B_PROMPT,
@@ -269,4 +331,5 @@ FORM_PROMPTS: dict[FormType, str] = {
     FormType.FORM_3922: FORM_3922_PROMPT,
     FormType.SHAREWORKS_SUPPLEMENTAL: "",  # Not a standard form; parsed by ShareworksAdapter
     FormType.SHAREWORKS_RSU_RELEASE: SHAREWORKS_RSU_RELEASE_PROMPT,
+    FormType.ROBINHOOD_CONSOLIDATED: ROBINHOOD_CONSOLIDATED_PROMPT,
 }

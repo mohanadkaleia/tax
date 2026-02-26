@@ -62,6 +62,7 @@ class ManualAdapter(BaseAdapter):
             FormType.FORM_3921: self._parse_3921,
             FormType.FORM_3922: self._parse_3922,
             FormType.SHAREWORKS_RSU_RELEASE: self._parse_shareworks_rsu,
+            FormType.ROBINHOOD_CONSOLIDATED: self._parse_consolidated,
         }
         return dispatch[form_type](raw)
 
@@ -75,6 +76,7 @@ class ManualAdapter(BaseAdapter):
             FormType.FORM_3921: self._validate_3921,
             FormType.FORM_3922: self._validate_3922,
             FormType.SHAREWORKS_RSU_RELEASE: self._validate_shareworks_rsu,
+            FormType.ROBINHOOD_CONSOLIDATED: self._validate_consolidated,
         }
         return dispatch[data.form_type](data)
 
@@ -89,6 +91,8 @@ class ManualAdapter(BaseAdapter):
         # If it's a list, inspect the first record
         sample = raw[0] if isinstance(raw, list) else raw
 
+        if "consolidated" in sample:
+            return FormType.ROBINHOOD_CONSOLIDATED
         if "box1_wages" in sample or "box2_federal_withheld" in sample:
             return FormType.W2
         if "vest_date" in sample and "release_price" in sample and "shares_vested" in sample:
@@ -406,6 +410,48 @@ class ManualAdapter(BaseAdapter):
             lots=lots,
         )
 
+    def _parse_consolidated(self, data: dict) -> ImportResult:
+        """Parse a Robinhood consolidated 1099 JSON into combined ImportResult."""
+        tax_year = int(data.get("tax_year", 0))
+        forms: list = []
+        sales: list = []
+
+        # 1099-DIV sub-form
+        div_data = data.get("form_1099div")
+        if div_data:
+            if "tax_year" not in div_data:
+                div_data["tax_year"] = tax_year
+            div_result = self._parse_1099div(div_data)
+            forms.extend(div_result.forms)
+            tax_year = tax_year or div_result.tax_year
+
+        # 1099-INT sub-form
+        int_data = data.get("form_1099int")
+        if int_data:
+            if "tax_year" not in int_data:
+                int_data["tax_year"] = tax_year
+            int_result = self._parse_1099int(int_data)
+            forms.extend(int_result.forms)
+            tax_year = tax_year or int_result.tax_year
+
+        # 1099-B sub-form
+        b_data = data.get("form_1099b")
+        if b_data:
+            for record in b_data:
+                if "tax_year" not in record:
+                    record["tax_year"] = tax_year
+            b_result = self._parse_1099b(b_data)
+            forms.extend(b_result.forms)
+            sales.extend(b_result.sales)
+            tax_year = tax_year or b_result.tax_year
+
+        return ImportResult(
+            form_type=FormType.ROBINHOOD_CONSOLIDATED,
+            tax_year=tax_year,
+            forms=forms,
+            sales=sales,
+        )
+
     # --- Validators ---
 
     def _validate_w2(self, data: ImportResult) -> list[str]:
@@ -512,6 +558,47 @@ class ManualAdapter(BaseAdapter):
                 errors.append(f"RSU vest {i + 1}: taxable_compensation must be >= 0")
         return errors
 
+    def _validate_consolidated(self, data: ImportResult) -> list[str]:
+        """Validate a consolidated import by running sub-form validators."""
+        errors: list[str] = []
+        has_any = False
+
+        # Validate each sub-form type present in the consolidated result
+        div_forms = [f for f in data.forms if isinstance(f, Form1099DIV)]
+        if div_forms:
+            has_any = True
+            div_result = ImportResult(
+                form_type=FormType.FORM_1099DIV,
+                tax_year=data.tax_year,
+                forms=div_forms,
+            )
+            errors.extend(self._validate_1099div(div_result))
+
+        int_forms = [f for f in data.forms if isinstance(f, Form1099INT)]
+        if int_forms:
+            has_any = True
+            int_result = ImportResult(
+                form_type=FormType.FORM_1099INT,
+                tax_year=data.tax_year,
+                forms=int_forms,
+            )
+            errors.extend(self._validate_1099int(int_result))
+
+        b_forms = [f for f in data.forms if isinstance(f, Form1099B)]
+        if b_forms:
+            has_any = True
+            b_result = ImportResult(
+                form_type=FormType.FORM_1099B,
+                tax_year=data.tax_year,
+                forms=b_forms,
+                sales=data.sales,
+            )
+            errors.extend(self._validate_1099b(b_result))
+
+        if not has_any:
+            errors.append("Consolidated 1099: no sub-form data found")
+
+        return errors
 
 
 def _decimal_or_none(value: str | int | float | None) -> Decimal | None:

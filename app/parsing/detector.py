@@ -22,6 +22,7 @@ FORM_SIGNATURES: list[tuple[FormType, list[str]]] = [
     (FormType.SHAREWORKS_RSU_RELEASE, ["Releases Report", "Release Price (Cost Basis)", "Vest Date"]),
     (FormType.FORM_3921, ["Form 3921", "Exercise of an Incentive Stock Option"]),
     (FormType.FORM_3922, ["Form 3922", "Transfer of Stock Acquired", "Employee Stock Purchase Plan"]),
+    (FormType.ROBINHOOD_CONSOLIDATED, ["Robinhood Securities LLC", "Summary Information"]),
     (FormType.FORM_1099B, ["Form 1099-B", "Proceeds From Broker"]),
     (FormType.FORM_1099DIV, ["Form 1099-DIV", "Dividends and Distributions"]),
     (FormType.FORM_1099INT, ["Form 1099-INT", "Interest Income"]),

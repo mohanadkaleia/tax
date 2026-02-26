@@ -307,7 +307,10 @@ CA_MENTAL_HEALTH_THRESHOLD = Decimal("1000000")
 CA_MENTAL_HEALTH_RATE = Decimal("0.01")
 
 # ---------------------------------------------------------------------------
-# SALT cap per IRC Section 164(b)(6) — TCJA 2018-2025
+# SALT cap per IRC Section 164(b)(6)
+# 2018-2024: TCJA cap of $10,000 ($5,000 MFS)
+# 2025+: One Big Beautiful Bill Act raised cap to $40,000 ($20,000 MFS)
+#         with AGI-based phase-out back to $10,000 ($5,000 MFS)
 # ---------------------------------------------------------------------------
 FEDERAL_SALT_CAP: dict[int, dict[FilingStatus, Decimal]] = {
     2024: {
@@ -317,10 +320,41 @@ FEDERAL_SALT_CAP: dict[int, dict[FilingStatus, Decimal]] = {
         FilingStatus.HOH: Decimal("10000"),
     },
     2025: {
+        FilingStatus.SINGLE: Decimal("40000"),
+        FilingStatus.MFJ: Decimal("40000"),
+        FilingStatus.MFS: Decimal("20000"),
+        FilingStatus.HOH: Decimal("40000"),
+    },
+}
+
+# SALT cap floor (the minimum after AGI phase-out)
+FEDERAL_SALT_CAP_FLOOR: dict[int, dict[FilingStatus, Decimal]] = {
+    2025: {
         FilingStatus.SINGLE: Decimal("10000"),
         FilingStatus.MFJ: Decimal("10000"),
         FilingStatus.MFS: Decimal("5000"),
         FilingStatus.HOH: Decimal("10000"),
+    },
+}
+
+# SALT cap AGI phase-out thresholds (One Big Beautiful Bill Act)
+# Phase-out starts at this AGI and reduces the cap linearly
+# down to the floor over a $100,000 range ($50,000 for MFS)
+SALT_PHASEOUT_START: dict[int, dict[FilingStatus, Decimal]] = {
+    2025: {
+        FilingStatus.SINGLE: Decimal("500000"),
+        FilingStatus.MFJ: Decimal("500000"),
+        FilingStatus.MFS: Decimal("250000"),
+        FilingStatus.HOH: Decimal("500000"),
+    },
+}
+
+SALT_PHASEOUT_RANGE: dict[int, dict[FilingStatus, Decimal]] = {
+    2025: {
+        FilingStatus.SINGLE: Decimal("100000"),
+        FilingStatus.MFJ: Decimal("100000"),
+        FilingStatus.MFS: Decimal("50000"),
+        FilingStatus.HOH: Decimal("100000"),
     },
 }
 

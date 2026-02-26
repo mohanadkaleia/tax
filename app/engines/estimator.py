@@ -28,11 +28,14 @@ from app.engines.brackets import (
     FEDERAL_BRACKETS,
     FEDERAL_LTCG_BRACKETS,
     FEDERAL_SALT_CAP,
+    FEDERAL_SALT_CAP_FLOOR,
     FEDERAL_STANDARD_DEDUCTION,
     MEDICAL_EXPENSE_AGI_FLOOR,
     NIIT_RATE,
     NIIT_THRESHOLD,
     REGULAR_MEDICARE_TAX_RATE,
+    SALT_PHASEOUT_RANGE,
+    SALT_PHASEOUT_START,
 )
 from app.models.deductions import ItemizedDeductionResult, ItemizedDeductions
 from app.models.enums import FilingStatus
@@ -473,12 +476,39 @@ class TaxEstimator:
         if medicare_tax_withheld_override is not None:
             medicare_tax_withheld = medicare_tax_withheld_override
 
-        # Add VPDI/SDI to state income tax for SALT deduction
-        if vpdi_total > Decimal("0") and itemized_detail is not None:
-            itemized_detail.state_income_tax_paid += vpdi_total
-            self.warnings.append(
-                f"Added ${vpdi_total:,.2f} CA VPDI/SDI (W-2 Box 14) to state income tax for SALT deduction."
-            )
+        # Auto-populate SALT from W-2 state withholding.
+        # If the user provided some itemized deductions (e.g. --charitable)
+        # but not --salt, merge the W-2 SALT data in so it isn't lost.
+        # If no deduction inputs at all, construct a fresh ItemizedDeductions.
+        w2_salt = state_withheld + vpdi_total
+        if w2_salt > Decimal("0"):
+            if itemized_detail is not None:
+                if itemized_detail.state_income_tax_paid == Decimal("0"):
+                    # User provided partial itemized inputs (e.g. --charitable)
+                    # but didn't specify --salt — fill in SALT from W-2 data
+                    itemized_detail.state_income_tax_paid = w2_salt
+                    self.warnings.append(
+                        f"Auto-filled SALT from W-2 state withholding "
+                        f"(${w2_salt:,.2f}). Pass --salt to override."
+                    )
+                elif vpdi_total > Decimal("0"):
+                    # User explicitly provided --salt; add VPDI on top
+                    # (VPDI is a separate Box 14 item often not in the user's SALT figure)
+                    itemized_detail.state_income_tax_paid += vpdi_total
+                    self.warnings.append(
+                        f"Added ${vpdi_total:,.2f} CA VPDI/SDI (W-2 Box 14) "
+                        f"to state income tax for SALT deduction."
+                    )
+            elif itemized_deductions is None:
+                # No deduction inputs at all — auto-construct from W-2 data
+                itemized_detail = ItemizedDeductions(
+                    state_income_tax_paid=w2_salt,
+                )
+                self.warnings.append(
+                    f"Auto-constructed itemized deductions from W-2 state withholding "
+                    f"(${w2_salt:,.2f} SALT). "
+                    f"The estimator will use whichever is higher: itemized or standard."
+                )
 
         return self.estimate(
             tax_year=tax_year,
@@ -529,14 +559,13 @@ class TaxEstimator:
         medical_deduction = max(deductions.medical_expenses - medical_floor, Decimal("0"))
 
         # 2. Federal SALT (capped per IRC 164(b)(6))
+        # 2025+: One Big Beautiful Bill raised cap to $40K with AGI phase-out
         uncapped_salt = (
             deductions.state_income_tax_paid
             + deductions.real_estate_taxes
             + deductions.personal_property_taxes
         )
-        salt_cap = FEDERAL_SALT_CAP.get(tax_year, {}).get(
-            filing_status, Decimal("10000")
-        )
+        salt_cap = self._effective_salt_cap(agi, filing_status, tax_year)
         federal_salt = min(uncapped_salt, salt_cap)
         salt_cap_lost = uncapped_salt - federal_salt
 
@@ -976,6 +1005,43 @@ class TaxEstimator:
         if not brackets:
             raise ValueError(f"No CA brackets for {tax_year}/{filing_status}")
         return self._apply_brackets(taxable_income, brackets)
+
+    @staticmethod
+    def _effective_salt_cap(
+        agi: Decimal, filing_status: FilingStatus, tax_year: int
+    ) -> Decimal:
+        """Compute the effective SALT cap after AGI-based phase-out.
+
+        For 2025+, the One Big Beautiful Bill Act raised the SALT cap to
+        $40,000 ($20K MFS) but phases it back down to $10,000 ($5K MFS)
+        for AGI between $500K-$600K ($250K-$300K MFS).
+        """
+        base_cap = FEDERAL_SALT_CAP.get(tax_year, {}).get(
+            filing_status, Decimal("10000")
+        )
+        floor = FEDERAL_SALT_CAP_FLOOR.get(tax_year, {}).get(
+            filing_status
+        )
+        phaseout_start = SALT_PHASEOUT_START.get(tax_year, {}).get(
+            filing_status
+        )
+        phaseout_range = SALT_PHASEOUT_RANGE.get(tax_year, {}).get(
+            filing_status
+        )
+
+        # No phase-out data → use base cap as-is (pre-2025 behavior)
+        if floor is None or phaseout_start is None or phaseout_range is None:
+            return base_cap
+
+        if agi <= phaseout_start:
+            return base_cap
+        if agi >= phaseout_start + phaseout_range:
+            return floor
+
+        # Linear phase-out
+        excess = agi - phaseout_start
+        reduction = (base_cap - floor) * excess / phaseout_range
+        return max(base_cap - reduction, floor)
 
     @staticmethod
     def _apply_brackets(

@@ -7,6 +7,7 @@ from app.parsing.extractors.form_1099div import Form1099DIVExtractor
 from app.parsing.extractors.form_1099int import Form1099INTExtractor
 from app.parsing.extractors.form_3921 import Form3921Extractor
 from app.parsing.extractors.form_3922 import Form3922Extractor
+from app.parsing.extractors.robinhood_consolidated import RobinhoodConsolidatedExtractor
 from app.parsing.extractors.shareworks_rsu import ShareworksRSUExtractor
 from app.parsing.extractors.w2 import W2Extractor
 
@@ -18,6 +19,7 @@ _EXTRACTOR_MAP: dict[FormType, type[BasePDFExtractor]] = {
     FormType.FORM_3921: Form3921Extractor,
     FormType.FORM_3922: Form3922Extractor,
     FormType.SHAREWORKS_RSU_RELEASE: ShareworksRSUExtractor,
+    FormType.ROBINHOOD_CONSOLIDATED: RobinhoodConsolidatedExtractor,
 }
 
 
@@ -34,6 +36,7 @@ __all__ = [
     "Form1099INTExtractor",
     "Form3921Extractor",
     "Form3922Extractor",
+    "RobinhoodConsolidatedExtractor",
     "ShareworksRSUExtractor",
     "W2Extractor",
 ]
